@@ -733,6 +733,48 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
+void gpt2_build_from_random(GPT2 *model, int depth) {
+    // init random (training from scratch)
+
+    // parameterize the size of gpt2 based only on the depth of the model (num_layers)
+    model->config.num_layers = depth;
+    // follows GPT-2 sizes
+    int channels, num_heads;
+    if      (depth == 6)  { channels = 384; num_heads = 6; } // gpt2-tiny (30M)
+    else if (depth == 12) { channels = 768; num_heads = 12; } // gpt2 (124M)
+    else if (depth == 24) { channels = 1024; num_heads = 16; } // gpt2-medium (350M)
+    else if (depth == 36) { channels = 1280; num_heads = 20; } // gpt2-large (774M)
+    else if (depth == 48) { channels = 1600; num_heads = 25; } // gpt2-xl (1558M)
+    else { fprintf(stderr, "Unsupported depth for now\n"); exit(EXIT_FAILURE); }
+    model->config.channels = channels;
+    model->config.num_heads = num_heads;
+    model->config.max_seq_len = 1024;
+    model->config.vocab_size = 50257;
+    model->config.padded_vocab_size = 50304; // padded to 128
+
+    // fill in all the parameter tensor dimensions and types
+    fill_in_parameter_sizes(model->param_sizes, model->config);
+    model->num_parameters = 0;
+    //model->num_parameters_bytes = 0;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        model->num_parameters += model->param_sizes[i];
+        //model->num_parameters_bytes += model->param_elements[i] * model->param_sizeof[i];
+    }
+    // create memory for model parameters on the device
+    model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes);
+
+    model->acts_memory = NULL;
+    model->grads_memory = NULL;
+    model->m_memory = NULL;
+    model->v_memory = NULL;
+    model->grads_acts_memory = NULL;
+    model->inputs = NULL;
+    model->targets = NULL;
+    model->batch_size = 0;
+    model->seq_len = 0;
+    model->mean_loss = -1.0f; // -1.0f will designate no loss
+}
+
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     // targets are optional and could be NULL
 
@@ -1069,9 +1111,9 @@ int sample_mult(float* probabilities, int n, float coin) {
 // main training loop
 int main() {
 
-    // build the GPT-2 model from a checkpoint
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    //gpt2_build_from_checkpoint(&model, "gpt2_124M.bin"); // to build from CP
+    gpt2_build_from_random(&model,12); // to build from scratch (depth 12)
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
     const char* tiny_stories_train = "dev/data/tinystories/TinyStories_train.bin";
