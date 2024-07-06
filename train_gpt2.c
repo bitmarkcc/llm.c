@@ -755,10 +755,10 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
     // fill in all the parameter tensor dimensions and types
     fill_in_parameter_sizes(model->param_sizes, model->config);
     model->num_parameters = 0;
-    //model->num_parameters_bytes = 0;
+    size_t num_parameters_bytes = 0;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         model->num_parameters += model->param_sizes[i];
-        //model->num_parameters_bytes += model->param_elements[i] * model->param_sizeof[i];
+        num_parameters_bytes += model->param_sizes[i] * sizeof(float);
     }
     // create memory for model parameters on the device
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes);
@@ -773,6 +773,62 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
     model->batch_size = 0;
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f will designate no loss
+
+    // allocate and random init the memory for all the parameters with GPT-2 schema
+    // weights ~N(0, 0.02), biases 0, c_proj weights ~N(0, 0.02/(2*L)**0.5)
+    // NOTE: assuming all parameters are of the type floatX, could be relaxed later
+    mt19937_state init_rng;
+    manual_seed(&init_rng, 42);
+    float* params_memory_cpu = (float*)mallocCheck(num_parameters_bytes);
+    memset(params_memory_cpu, 0, num_parameters_bytes);
+    // fill in all the weights with random values
+    float residual_scale = 1.0f / sqrtf(2.0f * model->config.num_layers);
+    // we have to init all these tensors exactly in the order that PyTorch initializes them
+    // so that we can match them up and get correctness and exactly the same initial conditions
+    size_t L = model->config.num_layers;
+    size_t offset = 0;
+    for (int l = 0; l < L; l++) {
+        offset = 0;
+        for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+            // the layernorm parameters are all initialized to 1
+            if (l == 0 && (i == 2 || i == 8 || i == 14)) { // only at l = 0 to init these just once
+                for (size_t j = 0; j < model->param_sizes[i]; j++) {
+                    params_memory_cpu[offset + j] = 1.0f;
+                }
+            }
+            // weights tensors are handled here
+            if ((l == 0 && (i == 0 || i == 1)) // only at l = 0, init the wte and wpe tensors
+              || i == 4 || i == 6 || i == 10 || i == 12) {
+                int n = model->param_sizes[i];
+                size_t layer_offset = 0;
+                if (i == 0) {
+                    // for wte tensor (padded vocab) override to init V instead of Vp rows
+                    n = model->config.vocab_size * model->config.channels;
+                }
+                if (i == 4 || i == 6 || i == 10 || i == 12) {
+                    // weight tensors, we are only initializing layer l
+                    assert(n % L == 0);
+                    n = n / L;
+                    layer_offset = l * n;
+                }
+                // in GPT-2, the projections back into the residual stream are additionally
+                // scaled by 1/sqrt(2*L) for training stability
+                float scale = (i == 6 || i == 12) ? 0.02f * residual_scale : 0.02f;
+                // okay let's draw the random numbers and write them
+                float *fp32_buffer = (float*)mallocCheck(n * sizeof(float));
+                normal_(fp32_buffer, n, 0.0f, scale, &init_rng);
+                for (size_t j = 0; j < n; j++) {
+                    params_memory_cpu[offset + layer_offset + j] = fp32_buffer[j];
+                }
+                free(fp32_buffer);
+            }
+            offset += model->param_sizes[i];
+        }
+    }
+
+    // copy them to the model
+    memcpy(model->params_memory, params_memory_cpu, num_parameters_bytes);
+    free(params_memory_cpu);
 }
 
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
