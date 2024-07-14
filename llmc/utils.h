@@ -16,6 +16,7 @@
 #ifndef _WIN32
 #include <dirent.h>
 #endif
+#include <stdbool.h>
 
 // ----------------------------------------------------------------------------
 // fread convenience utils, with nice handling of error checking using macros
@@ -180,6 +181,14 @@ extern inline int find_max_step(const char* output_log_dir) {
     }
     closedir(dir);
     return max_step;
+}
+
+bool in_uint_array(uint32_t* arr, size_t arr_len, uint32_t val) {
+    for (int i=0; i<arr_len; i++) {
+	if (arr[i] == val)
+	    return true;
+    }
+    return false;
 }
 
 #endif

@@ -149,7 +149,7 @@ inline unsigned long long randint64(mt19937_state* state) {
     return (((unsigned long long)(randint32(state)) << 32) | randint32(state));
 }
 
-inline float randfloat32(mt19937_state* state) {
+inline float randfloat32(mt19937_state* state) { // this is in [0,1) ?
     return (randint32(state) & ((1ull << 24) - 1)) * (1.0f / (1ull << 24));
 }
 
