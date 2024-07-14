@@ -19,6 +19,7 @@ There will be other versions of this code that specialize it and make it fast.
 #include <unistd.h>
 #include <limits.h>
 #include <openssl/sha.h>
+#include <float.h>
 #ifdef OMP
 #include <omp.h>
 #endif
@@ -1397,8 +1398,8 @@ int main(int argc, char** argv) {
 	for (int j=0; j<n_sweeps; j++) {
 	    int ret = gpt2_train(&loss,&weight_state,depth,n_active_weights,rng_seed_offset+i,rng_seed_offset+j);
 	    printf("main() seed = %u loss = %f\n",rng_seed_offset+rng_seed,loss);
-	    if (loss<min_loss) {
-		min_loss = loss;
+	    if (loss<best_loss) {
+		best_loss = loss;
 		memcpy(best_weight_state,weight_state,n_active_weights*8);
 	    }
 	    /*for (int j=0; j<n_active_weights*8; j++) {
