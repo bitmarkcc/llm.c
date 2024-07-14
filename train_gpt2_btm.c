@@ -1380,7 +1380,7 @@ int main(int argc, char** argv) {
     int depth = 12;
     if (argc>1)
 	depth = atoi(argv[1]);
-    size_t n_active_weights = 2048;
+    size_t n_active_weights = 62000;
     if (argc>2)
 	n_active_weights = atoi(argv[2]);
     unsigned int rng_seed_offset = 0;
@@ -1391,10 +1391,16 @@ int main(int argc, char** argv) {
     float loss = -1.0f;
     unsigned char* weight_state = 0;
     unsigned int rng_seed = 0;
+    float best_loss = FLT_MAX;
+    unsigned char* best_weight_state = malloc(n_active_weights*8);
     for (int i=0; i<n_sweeps; i++) {
 	for (int j=0; j<n_sweeps; j++) {
 	    int ret = gpt2_train(&loss,&weight_state,depth,n_active_weights,rng_seed_offset+i,rng_seed_offset+j);
 	    printf("main() seed = %u loss = %f\n",rng_seed_offset+rng_seed,loss);
+	    if (loss<min_loss) {
+		min_loss = loss;
+		memcpy(best_weight_state,weight_state,n_active_weights*8);
+	    }
 	    /*for (int j=0; j<n_active_weights*8; j++) {
 	      printf(" %u",weight_state[j]);
 	      }*/
