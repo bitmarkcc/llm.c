@@ -1391,13 +1391,12 @@ int main(int argc, char** argv) {
     int n_sweeps = 10;
     float loss = -1.0f;
     unsigned char* weight_state = 0;
-    unsigned int rng_seed = 0;
     float best_loss = FLT_MAX;
     unsigned char* best_weight_state = malloc(n_active_weights*8);
     for (int i=0; i<n_sweeps; i++) {
 	for (int j=0; j<n_sweeps; j++) {
 	    int ret = gpt2_train(&loss,&weight_state,depth,n_active_weights,rng_seed_offset+i,rng_seed_offset+j);
-	    printf("main() seed = %u loss = %f\n",rng_seed_offset+rng_seed,loss);
+	    printf("main() seed = (%u,%u) loss = %f\n",rng_seed_offset+i,rng_seed_offset+j,loss);
 	    if (loss<best_loss) {
 		best_loss = loss;
 		memcpy(best_weight_state,weight_state,n_active_weights*8);
@@ -1409,6 +1408,13 @@ int main(int argc, char** argv) {
 	    if (weight_state) free(weight_state);
 	}
     }
+    printf("best_loss = %f\n",best_loss);
+    printf("weight_state =");
+    for (int i=0; i<n_active_weights*8; i++) {
+      printf(" %u",best_weight_state[i]);
+    }
+    printf("\n");
+    if (best_weight_state) free(best_weight_state);
     return 0;
 }
 #endif
