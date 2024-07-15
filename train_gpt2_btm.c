@@ -31,6 +31,8 @@ There will be other versions of this code that specialize it and make it fast.
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
 #include "llmc/dataloader.h"
 
+typedef unsigned char uchar;
+
 // ----------------------------------------------------------------------------
 // all the individual layers' forward and backward passes
 // B = batch_size, T = sequence_length, C = channels, V = vocab_size
@@ -740,7 +742,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
-void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, unsigned int rng_seed_1, unsigned int rng_seed_2) {
+void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, unsigned int rng_seed_1, unsigned int rng_seed_2, uchar* cp, size_t cp_bytes) {
     // init random (training from scratch)
 
     // parameterize the size of gpt2 based only on the depth of the model (num_layers)
@@ -869,6 +871,17 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
             }
             offset += model->param_sizes[i];
         }
+    }
+
+    // apply checkpoint data
+    if (cp_bytes % 8 != 0) {
+	printf("Warning: The size of the checkpoint data is not a multiple of 8. Ignoring it.\n");
+    }
+    size_t n_cp_weights = cp_bytes/8;
+    for (int i=0; i<n_cp_weights; i++) {
+	uint32_t weight_index = ((uint32_t*)cp)[2*i];
+	float weight_value = ((float*)cp)[2*i+1];
+	params_memory_cpu[weight_index] = weight_value;
     }
 
     // copy them to the model
@@ -1222,11 +1235,11 @@ int sample_mult(float* probabilities, int n, float coin) {
 // ----------------------------------------------------------------------------
 // main training loop
 //int main(int argc, char** argv) {
-int gpt2_train(float* ploss, unsigned char** p_weight_state, int depth, size_t n_active_weights, unsigned int rng_seed_1, unsigned int rng_seed_2) {
+int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* cp, size_t cp_bytes, int depth, size_t n_active_weights, unsigned int rng_seed_1, unsigned int rng_seed_2) {
 
     GPT2 model;
     //gpt2_build_from_checkpoint(&model, "gpt2_124M.bin"); // to build from CP
-    gpt2_build_from_random(&model,depth,n_active_weights,rng_seed_1,rng_seed_2); // to build from scratch
+    gpt2_build_from_random(&model,depth,n_active_weights,rng_seed_1,rng_seed_2,cp,cp_bytes);
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
     const char* tiny_stories_train = "dev/data/tinystories/TinyStories_train.bin";
@@ -1248,7 +1261,7 @@ int gpt2_train(float* ploss, unsigned char** p_weight_state, int depth, size_t n
     // build the Tokenizer
     Tokenizer tokenizer;
     tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
-
+    
     // some memory for generating samples from the model
     uint64_t rng_state = 1337;
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
@@ -1260,9 +1273,10 @@ int gpt2_train(float* ploss, unsigned char** p_weight_state, int depth, size_t n
 	params_active[i] = model.params_memory+model.active_weights[i];
     }
 
-    size_t weight_state_size = model.n_active_weights*(sizeof(uint32_t)+sizeof(float));
-    // <weightIndex1><weightValue1>...<weightIndexN><weightValueN>
-    unsigned char* weight_state = malloc(weight_state_size);
+    size_t weight_state_size = model.n_active_weights*(sizeof(uint32_t)+sizeof(float))+32;
+    // <block_hash><weightIndex1><weightValue1>...<weightIndexN><weightValueN>
+    uchar* weight_state = malloc(weight_state_size);
+    memcpy(weight_state,block_hash,32);
     
     // train
     struct timespec start, end;
@@ -1274,18 +1288,20 @@ int gpt2_train(float* ploss, unsigned char** p_weight_state, int depth, size_t n
 
 	    // hash the active weights
 	    unsigned int hash [8]; // hash is 256 bit = 8*32 bit
+	    unsigned int hash2 [8];
 	    for (int i=0; i<model.n_active_weights; i++) {
-		memcpy(weight_state+i*8,model.active_weights+i,4);
-		memcpy(weight_state+i*8+4,params_active[i],4);
+		memcpy(weight_state+32+i*8,model.active_weights+i,4);
+		memcpy(weight_state+32+i*8+4,params_active[i],4);
 	    }
 	    /*printf("Do SHA256 of: \n");
 	    for (int i=0; i<weight_state_size; i++) {
 		printf("%u ",weight_state[i]);
 	    }
 	    printf("\n");*/
-	    SHA256(weight_state,weight_state_size,(unsigned char*)hash);
-	    // set seed to first 4 bytes of hash
-	    manual_seed(&(val_loader.shuffle_rng),*hash);
+	    SHA256(weight_state,weight_state_size,(uchar*)hash);
+	    SHA256((uchar*)hash,32,(uchar*)hash2);
+	    // set seed to first 4 bytes of hash (todo: use full 32 bytes)
+	    manual_seed(&(val_loader.shuffle_rng),*hash2);
 	  
             float val_loss = 0.0f;
             dataloader_reset(&val_loader);
@@ -1378,43 +1394,83 @@ int main(int argc, char** argv) {
     assert(CHAR_BIT * sizeof(float) == 32);
     assert(CHAR_BIT * sizeof(unsigned int) == 32);
 
-    int depth = 12;
-    if (argc>1)
-	depth = atoi(argv[1]);
-    size_t n_active_weights = 62000;
-    if (argc>2)
-	n_active_weights = atoi(argv[2]);
-    unsigned int rng_seed_offset = 0;
-    if (argc>3)
-	rng_seed_offset = atoi(argv[3]);
+    struct timespec ts;
+    timespec_get(&ts,TIME_UTC);
+    printf("unix time = %lu\n",ts.tv_sec);
 
-    int n_sweeps = 10;
+    uchar* block_hash = 0;
+    if (argc>1) {
+	int len = hex_to_uchar(&block_hash,argv[1]);
+	if (len != 32) {
+	    printf("block hash length must be 32 bytes (length 64 hex string)\n");
+	    exit(1);
+	}
+	printf("have block_hash =");
+	for (int i=0; i<32; i++)
+	    printf(" %02x",block_hash[i]);
+	printf("\n");
+    }
+    int depth = 12;
+    if (argc>2)
+	depth = atoi(argv[2]);
+    size_t n_active_weights = 62000;
+    if (argc>3)
+	n_active_weights = atoi(argv[3]);
+    unsigned int rng_seed_offset = ts.tv_sec;
+    if (argc>4)
+	rng_seed_offset = atoi(argv[4]);
+
+    size_t n_active_bytes = n_active_weights*8;
+    
+    const char* cpfname = "btm-cp.bin"; // checkpoint file name
+    FILE* cpf = fopen(cpfname,"rb");
+    uchar* cp = 0;
+    size_t cp_bytes = 0;
+    if (cpf) {
+	printf("train from checkpoint\n");
+	fseek(cpf,0L,SEEK_END);
+	cp_bytes = ftell(cpf);
+	fseek(cpf,0L,SEEK_SET);
+	cp = malloc(cp_bytes);
+	int ret = fread(cp,1,cp_bytes,cpf);
+	fclose(cpf);
+    }
+
+    int n_sweeps = 10; // this squared is the number of training calls
     float loss = -1.0f;
-    unsigned char* weight_state = 0;
+    uchar* weight_state = 0;
     float best_loss = FLT_MAX;
-    unsigned char* best_weight_state = malloc(n_active_weights*8);
+    uchar* best_weight_state = malloc(n_active_bytes);
     for (int i=0; i<n_sweeps; i++) {
 	for (int j=0; j<n_sweeps; j++) {
-	    int ret = gpt2_train(&loss,&weight_state,depth,n_active_weights,rng_seed_offset+i,rng_seed_offset+j);
+	    int ret = gpt2_train(&loss,&weight_state,block_hash,cp,cp_bytes,depth,n_active_weights,rng_seed_offset+i,rng_seed_offset+j);
 	    printf("main() seed = (%u,%u) loss = %f\n",rng_seed_offset+i,rng_seed_offset+j,loss);
 	    if (loss<best_loss) {
 		best_loss = loss;
-		memcpy(best_weight_state,weight_state,n_active_weights*8);
+		memcpy(best_weight_state,weight_state,n_active_bytes);
 	    }
-	    /*for (int j=0; j<n_active_weights*8; j++) {
-	      printf(" %u",weight_state[j]);
-	      }*/
-	    //printf("\n");
 	    if (weight_state) free(weight_state);
 	}
     }
     printf("best_loss = %f\n",best_loss);
-    printf("weight_state =");
-    for (int i=0; i<n_active_weights*8; i++) {
-      printf(" %u",best_weight_state[i]);
+    cpf = fopen(cpfname,"ab");
+    if (!cpf) {
+	printf("error opening file %s for writing\n",cpfname);
+	exit(1);
     }
-    printf("\n");
+    else {	
+	printf("weight_state =");
+	for (int i=0; i<64*8; i++) {
+	    printf(" %u",best_weight_state[i]);
+	}
+	printf(" ...\n");
+
+	size_t ret = fwrite(best_weight_state,1,n_active_bytes,cpf);
+	printf("wrote %lu bytes to file %s\n",ret,cpfname);
+	fclose(cpf);
+    }
     if (best_weight_state) free(best_weight_state);
+    if (block_hash) free(block_hash);
     return 0;
 }
 #endif

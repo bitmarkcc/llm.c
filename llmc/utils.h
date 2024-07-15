@@ -18,6 +18,9 @@
 #endif
 #include <stdbool.h>
 
+// for converting from hex to uchar
+static const unsigned char phexdigit[256] = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,1,2,3,4,5,6,7,8,9,0,0,0,0,0,0, 0,0xa,0xb,0xc,0xd,0xe,0xf,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0xa,0xb,0xc,0xd,0xe,0xf,0,0,0,0,0,0,0,0,0 };
+
 // ----------------------------------------------------------------------------
 // fread convenience utils, with nice handling of error checking using macros
 // simple replace fopen, fread, fclose, fseek
@@ -183,12 +186,27 @@ extern inline int find_max_step(const char* output_log_dir) {
     return max_step;
 }
 
-bool in_uint_array(uint32_t* arr, size_t arr_len, uint32_t val) {
+bool in_uint_array (uint32_t* arr, size_t arr_len, uint32_t val) {
     for (int i=0; i<arr_len; i++) {
 	if (arr[i] == val)
 	    return true;
     }
     return false;
+}
+
+size_t hex_to_uchar (unsigned char** pout, const char* hex) { // todo check hex is valid
+    size_t len = strlen(hex)/2;
+    *pout = malloc(len);
+    for (int i=0; i<len; i++) {
+	const char* s = hex+2*i;
+	unsigned char c = phexdigit[*s];
+	unsigned char n = (c << 4);
+	s++;
+	c = phexdigit[*s];
+	n |= c;
+	(*pout)[i] = n;
+    }
+    return len;
 }
 
 #endif
