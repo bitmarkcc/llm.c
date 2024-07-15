@@ -1293,12 +1293,16 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
 		memcpy(weight_state+32+i*8,model.active_weights+i,4);
 		memcpy(weight_state+32+i*8+4,params_active[i],4);
 	    }
-	    /*printf("Do SHA256 of: \n");
+	    printf("Do SHA256 of: \n");
 	    for (int i=0; i<weight_state_size; i++) {
 		printf("%u ",weight_state[i]);
 	    }
-	    printf("\n");*/
+	    printf("\n");
 	    SHA256(weight_state,weight_state_size,(uchar*)hash);
+	    printf("hash =");
+	    for (int i=0; i<4; i++)
+		printf(" %u",((uchar*)hash)[i]);
+	    printf("\n");
 	    SHA256((uchar*)hash,32,(uchar*)hash2);
 	    printf("hash2 =");
 	    for (int i=0; i<4; i++)
