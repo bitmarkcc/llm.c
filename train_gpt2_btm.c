@@ -1300,6 +1300,10 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
 	    printf("\n");*/
 	    SHA256(weight_state,weight_state_size,(uchar*)hash);
 	    SHA256((uchar*)hash,32,(uchar*)hash2);
+	    printf("hash2 =");
+	    for (int i=0; i<4; i++)
+		printf(" %u",((uchar*)hash2)[i]);
+	    printf("\n");
 	    // set seed to first 4 bytes of hash (todo: use full 32 bytes)
 	    manual_seed(&(val_loader.shuffle_rng),*hash2);
 	  
@@ -1307,11 +1311,11 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
-		/*printf("inputs:");
+		printf("inputs:");
 		for (int j=0; j<B*T; j++) {
 		    printf(" %d",train_loader.inputs[j]);
 		}
-		printf("\n");*/
+		printf("\n");
 		gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
                 val_loss += model.mean_loss;
             }
