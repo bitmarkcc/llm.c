@@ -1,4 +1,5 @@
 CC ?= clang
+CXX ?= clang++
 CFLAGS = -g3 -Ofast -Wno-unused-result -Wno-ignored-pragmas -Wno-unknown-attributes
 LDFLAGS =
 LDLIBS = -lm
@@ -259,7 +260,7 @@ train_gpt2: train_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
 
 train_gpt2_btm: train_gpt2_btm.c
-	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) -lcrypto $(OUTPUT_FILE)
+	$(CXX) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) -lcrypto -lmpfr $(OUTPUT_FILE)
 
 test_gpt2: test_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)

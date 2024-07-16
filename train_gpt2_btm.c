@@ -20,6 +20,7 @@ There will be other versions of this code that specialize it and make it fast.
 #include <limits.h>
 #include <openssl/sha.h>
 #include <float.h>
+#include <iostream>
 #ifdef OMP
 #include <omp.h>
 #endif
@@ -30,6 +31,8 @@ There will be other versions of this code that specialize it and make it fast.
 #include "llmc/tokenizer.h"
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
 #include "llmc/dataloader.h"
+// defines: pfloat
+#include "llmc/pfloat.h"
 
 typedef unsigned char uchar;
 
@@ -789,11 +792,11 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
     manual_seed(&init_rng_1, rng_seed_1);
 
     // get a random subset of weights
-    uint32_t* active_weights = malloc(n_active_weights*sizeof(uint32_t));
+    uint32_t* active_weights = (uint32_t*)malloc(n_active_weights*sizeof(uint32_t));
     size_t n_weights = model->num_parameters;
     for (size_t i=0; i<n_active_weights; i++)
 	active_weights[i] = n_weights; // dummy value
-    bool* params_memory_active = malloc(sizeof(bool)*n_weights);
+    bool* params_memory_active = (bool*)malloc(sizeof(bool)*n_weights);
     for (size_t i=0; i<n_weights; i++)
 	params_memory_active[i] = false;
     int i_active = 0;
@@ -1271,14 +1274,14 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
     const int genT = 64; // number of steps of inference we will do
 
     // pointers to active weights/params
-    float** params_active = malloc(model.n_active_weights*sizeof(float*));
+    float** params_active = (float**)malloc(model.n_active_weights*sizeof(float*));
     for (int i=0; i<model.n_active_weights; i++) {
 	params_active[i] = model.params_memory+model.active_weights[i];
     }
 
     size_t weight_state_size = model.n_active_weights*(sizeof(uint32_t)+sizeof(float))+32;
     // <block_hash><weightIndex1><weightValue1>...<weightIndexN><weightValueN>
-    uchar* weight_state = malloc(weight_state_size);
+    uchar* weight_state = (uchar*)malloc(weight_state_size);
     memcpy(weight_state,block_hash,32);
     
     // train
@@ -1410,6 +1413,13 @@ int main(int argc, char** argv) {
     assert(CHAR_BIT * sizeof(float) == 32);
     assert(CHAR_BIT * sizeof(unsigned int) == 32);
 
+    boost::multiprecision::mpfr_float::default_precision(8);
+    std::cout << std::fixed;
+    std::cout.precision(8);
+
+    //pfloat a = 2;
+    //std::cout << sqrt(a) << std::endl;
+
     struct timespec ts;
     timespec_get(&ts,TIME_UTC);
     printf("unix time = %lu\n",ts.tv_sec);
@@ -1447,7 +1457,7 @@ int main(int argc, char** argv) {
 	fseek(cpf,0L,SEEK_END);
 	cp_bytes = ftell(cpf);
 	fseek(cpf,0L,SEEK_SET);
-	cp = malloc(cp_bytes);
+	cp = (uchar*)malloc(cp_bytes);
 	int ret = fread(cp,1,cp_bytes,cpf);
 	fclose(cpf);
     }
@@ -1458,7 +1468,7 @@ int main(int argc, char** argv) {
     float loss = -1.0f;
     uchar* weight_state = 0;
     float best_loss = FLT_MAX;
-    uchar* best_weight_state = malloc(n_active_bytes);
+    uchar* best_weight_state = (uchar*)malloc(n_active_bytes);
     for (int i=0; i<n_sweeps; i++) {
 	for (int j=0; j<n_sweeps; j++) {
 	    int ret = gpt2_train(&loss,&weight_state,block_hash,cp,cp_bytes,depth,n_active_weights,rng_seed_offset+i,rng_seed_offset+j);

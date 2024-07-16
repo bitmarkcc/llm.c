@@ -196,7 +196,7 @@ bool in_uint_array (uint32_t* arr, size_t arr_len, uint32_t val) {
 
 size_t hex_to_uchar (unsigned char** pout, const char* hex) { // todo check hex is valid
     size_t len = strlen(hex)/2;
-    *pout = malloc(len);
+    *pout = (unsigned char*)malloc(len);
     for (int i=0; i<len; i++) {
 	const char* s = hex+2*i;
 	unsigned char c = phexdigit[*s];
