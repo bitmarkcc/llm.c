@@ -877,13 +877,15 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
     if (cp_bytes % 8 != 0) {
 	printf("Warning: The size of the checkpoint data is not a multiple of 8. Ignoring it.\n");
     }
-    size_t n_cp_weights = cp_bytes/8;
-    for (int i=0; i<n_cp_weights; i++) {
-	uint32_t weight_index = ((uint32_t*)cp)[2*i];
-	float weight_value = ((float*)cp)[2*i+1];
-	params_memory_cpu[weight_index] = weight_value;
+    else {
+	size_t n_cp_weights = cp_bytes/8;
+	for (int i=0; i<n_cp_weights; i++) {
+	    uint32_t weight_index = ((uint32_t*)cp)[2*i];
+	    float weight_value = ((float*)cp)[2*i+1];
+	    //printf("i=%d weight_index=%u, weight_value=%.2e\n",i,weight_index,weight_value);
+	    params_memory_cpu[weight_index] = weight_value;
+	}
     }
-
     // copy them to the model
     memcpy(model->params_memory, params_memory_cpu, num_parameters_bytes);
     free(params_memory_cpu);
@@ -1295,7 +1297,7 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
 	    }
 	    printf("Do SHA256 of: \n");
 	    for (int i=0; i<weight_state_size; i++) {
-		printf("%u ",weight_state[i]);
+		printf("%u\n",weight_state[i]);
 	    }
 	    printf("\n");
 	    SHA256(weight_state,weight_state_size,(uchar*)hash);
@@ -1327,7 +1329,7 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
             printf("val loss %f\n", val_loss);
 	    if (step == n_steps) { // return results
 		*ploss = val_loss;
-		*p_weight_state = weight_state;
+		*p_weight_state = weight_state+32; // ignore the block-hash part
 		dataloader_free(&train_loader);
 		dataloader_free(&val_loader);
 		tokenizer_free(&tokenizer);
@@ -1443,6 +1445,8 @@ int main(int argc, char** argv) {
 	int ret = fread(cp,1,cp_bytes,cpf);
 	fclose(cpf);
     }
+
+    printf("cp_bytes = %lu\n",cp_bytes);
 
     int n_sweeps = 10; // this squared is the number of training calls
     float loss = -1.0f;
