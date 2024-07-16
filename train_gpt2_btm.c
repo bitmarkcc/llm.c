@@ -882,7 +882,8 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
 	for (int i=0; i<n_cp_weights; i++) {
 	    uint32_t weight_index = ((uint32_t*)cp)[2*i];
 	    float weight_value = ((float*)cp)[2*i+1];
-	    //printf("i=%d weight_index=%u, weight_value=%.2e\n",i,weight_index,weight_value);
+	    if (params_memory_cpu[weight_index] != 0.0f)
+		printf("i=%d weight_index=%u, weight_value=%.8e\n",i,weight_index,weight_value);
 	    params_memory_cpu[weight_index] = weight_value;
 	}
     }
@@ -1295,9 +1296,14 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
 		memcpy(weight_state+32+i*8,model.active_weights+i,4);
 		memcpy(weight_state+32+i*8+4,params_active[i],4);
 	    }
-	    printf("Do SHA256 of: \n");
-	    for (int i=0; i<weight_state_size; i++) {
-		printf("%u\n",weight_state[i]);
+	    printf("Do SHA256 of:\n");
+	    for (int i=0; i<32; i++) {
+		printf(" %02x",weight_state[i]);
+	    }
+	    printf("\n");
+	    for (int i=0; i<model.n_active_weights; i++) {
+		printf("%u ",*((uint32_t*)(weight_state+32+i*8)));
+		printf("%.8e\n",*((float*)(weight_state+32+i*8+4)));
 	    }
 	    printf("\n");
 	    SHA256(weight_state,weight_state_size,(uchar*)hash);
