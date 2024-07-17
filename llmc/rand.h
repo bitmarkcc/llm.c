@@ -84,6 +84,7 @@ Both output:
 #define RAND_H
 
 #include <math.h>
+#include "pfloat.h"
 
 #define MERSENNE_STATE_M 397u
 #define MERSENNE_STATE_N 624u
@@ -153,8 +154,16 @@ inline float randfloat32(mt19937_state* state) { // this is in [0,1) ?
     return (randint32(state) & ((1ull << 24) - 1)) * (1.0f / (1ull << 24));
 }
 
+inline pfloat randpfloat32(mt19937_state* state) {
+    return (randint32(state) & ((1ull << 24) - 1)) * (pfloat(1) / (1ull << 24));
+}
+
 inline double randfloat64(mt19937_state* state) {
     return (randint64(state) & ((1ull << 53) - 1)) * (1.0 / (1ull << 53));
+}
+
+inline pdouble randpfloat64(mt19937_state* state) {
+    return (randint64(state) & ((1ull << 53) - 1)) * (pdouble(1) / (1ull << 53));
 }
 
 void uniform_(float* data, unsigned int numel, float from, float to, mt19937_state* state) {
@@ -216,6 +225,61 @@ void normal_(float* data, unsigned int numel, float mean, float std, mt19937_sta
             next_double_normal_sample = radius * sinf(theta);
             has_next_double_normal_sample = 1;
             data[t] = (radius * cosf(theta) * std + mean);
+        }
+    }
+}
+
+void pnormal_fill_16(pfloat* data, pfloat mean, pfloat std) {
+    #define EPSILONE 1e-12f
+    for (unsigned int t = 0; t < 8; t++) {
+        pfloat u1 = 1 - data[t];
+        pfloat u2 = data[t + 8];
+        pfloat radius = sqrt(-2 * log(u1 + EPSILONE));
+        pfloat theta = 2.0 * M_PI * u2;
+        data[t] = (radius * cos(theta) * std + mean);
+        data[t + 8] = (radius * sin(theta) * std + mean);
+    }
+}
+
+void pnormal_fill(pfloat* data, unsigned int numel, pfloat mean, pfloat std, mt19937_state* state) {
+    for (unsigned int t = 0; t < numel; t++) {
+        data[t] = randpfloat32(state);
+    }
+    for (unsigned int i = 0; i < numel - 15; i += 16) {
+        pnormal_fill_16(data + i, mean, std);
+    }
+    if (numel % 16 != 0) {
+        // recompute the last 16 values
+        data = data + numel - 16;
+        for (unsigned int i = 0; i < 16; i++) {
+            data[i] = randpfloat32(state);
+        }
+        pnormal_fill_16(data, mean, std);
+    }
+}
+
+void pnormal_(pfloat* data, unsigned int numel, pfloat mean, pfloat std, mt19937_state* state) {
+    #define EPSILONE 1e-12f
+    if (numel >= 16) {
+        pnormal_fill(data, numel, mean, std, state);
+    }
+    else {
+        pdouble next_double_normal_sample = 0.0; // make compiler warning happy, won't be used
+        int has_next_double_normal_sample = 0;
+        for (unsigned int  t = 0; t < numel; t++) {
+            if (has_next_double_normal_sample) {
+                data[t] = (next_double_normal_sample * std + mean).convert_to<double>();
+                has_next_double_normal_sample = 0;
+                continue;
+            }
+            // for numel < 16 we draw a double (float64)
+            pfloat u1 = randpfloat64(state).convert_to<double>();
+            pfloat u2 = randpfloat64(state).convert_to<double>();
+            pfloat radius = sqrt(-2 * log(1 - u2 + EPSILONE));
+            pfloat theta = 2.0 * M_PI * u1;
+            next_double_normal_sample = radius * sin(theta);
+            has_next_double_normal_sample = 1;
+            data[t] = (radius * cos(theta) * std + mean);
         }
     }
 }
