@@ -241,27 +241,40 @@ void pnormal_fill_16(pfloat* data, pfloat mean, pfloat std) {
     }
 }
 
-void pnormal_fill(pfloat* data, unsigned int numel, pfloat mean, pfloat std, mt19937_state* state) {
+void pnormal_fill(pfloat* data, unsigned int numel, pfloat mean, pfloat std, mt19937_state* state, bool* params_memory_active_offset) {
     for (unsigned int t = 0; t < numel; t++) {
-        data[t] = randpfloat32(state);
+	if (t%1000000==1)
+	    printf("t = %u set data to randpfloat32\n",t);
+	if (params_memory_active_offset[t]) {
+	    data[t] = randpfloat32(state);
+	}
+	else {
+	    data[t] = pfloat(0);
+	}
     }
+    printf("pnormal_fill(): did set data to randpfloat32s\n");
     for (unsigned int i = 0; i < numel - 15; i += 16) {
+	if ((i/16)%100000==1)
+	    printf("t = %u do pnormal_fill_16\n",i);
         pnormal_fill_16(data + i, mean, std);
     }
+    printf("pnormal_fill(): did pnormal_fill_16s\n");
     if (numel % 16 != 0) {
+	printf("pnormal_fill(): recompute\n");
         // recompute the last 16 values
         data = data + numel - 16;
         for (unsigned int i = 0; i < 16; i++) {
             data[i] = randpfloat32(state);
         }
         pnormal_fill_16(data, mean, std);
+	printf("did recompute\n");
     }
 }
 
-void pnormal_(pfloat* data, unsigned int numel, pfloat mean, pfloat std, mt19937_state* state) {
+void pnormal_(pfloat* data, unsigned int numel, pfloat mean, pfloat std, mt19937_state* state, bool* params_memory_active_offset) {
     #define EPSILONE 1e-12f
     if (numel >= 16) {
-        pnormal_fill(data, numel, mean, std, state);
+        pnormal_fill(data, numel, mean, std, state, params_memory_active_offset);
     }
     else {
         pdouble next_double_normal_sample = 0.0; // make compiler warning happy, won't be used

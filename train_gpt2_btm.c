@@ -826,7 +826,9 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
     pfloat* params_memory_cpu = (pfloat*)mallocCheck(num_parameters_bytes);
     //memset(params_memory_cpu, 0, num_parameters_bytes);
     for (size_t i=0; i<n_weights; i++) {
-	params_memory_cpu[i] = 0;
+	if (i%1000000==0)
+	    printf("set params_memory_cpu[%lu] = 0\n",i);
+	params_memory_cpu[i] = pfloat(0);
     }
     // fill in all the weights with random values
     pfloat residual_scale = 1.0f / sqrt(2.0f * model->config.num_layers);
@@ -862,18 +864,23 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
                 // scaled by 1/sqrt(2*L) for training stability
                 pfloat scale = (i == 6 || i == 12) ? 0.02f * residual_scale : pfloat(0.02f);
                 // okay let's draw the random numbers and write them
-                pfloat *fp32_buffer = (pfloat*)mallocCheck(n * sizeof(pfloat));
-                pnormal_(fp32_buffer, n, 0.0f, scale, &init_rng_2);
+                //pfloat *fp32_buffer = (pfloat*)mallocCheck(n * sizeof(pfloat));
+		std::vector<pfloat> vpfBuffer (n);
+		printf("call pnormal_ with n=%d\n",n);
+                pnormal_(vpfBuffer.data(), n, 0.0f, scale, &init_rng_2, params_memory_active+offset+layer_offset);
+		printf("did pnormal_\n");
                 for (size_t j = 0; j < n; j++) {
 		    size_t i_pmc = offset+layer_offset+j;
 		    if (params_memory_active[i_pmc]) {
-			params_memory_cpu[i_pmc] = fp32_buffer[j];
+			printf("set params_memory_cpu[%lu] to %.8e\n",i_pmc,vpfBuffer[j].convert_to<float>());
+			params_memory_cpu[i_pmc] = vpfBuffer[j];
 		    }
 		    /*else { // set inactive weights to 0
 			params_memory_cpu[i_pmc] = 0.0f;
 			}*/
                 }
-                free(fp32_buffer);
+		vpfBuffer.clear();
+                //free(fp32_buffer);
             }
             offset += model->param_sizes[i];
         }
@@ -886,6 +893,7 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
     else {
 	size_t n_cp_weights = cp_bytes/8;
 	for (int i=0; i<n_cp_weights; i++) {
+	    printf("i_cp = %d\n",i);
 	    uint32_t weight_index = ((uint32_t*)cp)[2*i];
 	    pfloat weight_value = ((float*)cp)[2*i+1];
 	    if (params_memory_cpu[weight_index] != 0.0f)
