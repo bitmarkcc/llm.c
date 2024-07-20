@@ -60,7 +60,7 @@ void encoder_forward(pfloat* out,
             // add the two vectors and store the result in out[b,t,:]
             for (int i = 0; i < C; i++) {
                 out_bt[i] = wte_ix[i] + wpe_t[i];
-            }
+	    }
         }
     }
 }
@@ -585,20 +585,21 @@ void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
-pfloat* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes) {
+std::vector<pfloat>* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes) {
     size_t num_parameters = 0;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         num_parameters += param_sizes[i];
     }
     // malloc all parameters all at once
-    pfloat* params_memory = (pfloat*)mallocCheck(num_parameters * sizeof(pfloat));
+    //pfloat* params_memory = (pfloat*)mallocCheck(num_parameters * sizeof(pfloat));
+    std::vector<pfloat>* params_memory = new std::vector<pfloat>(num_parameters);
     // assign all the tensors
     pfloat** ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
         &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
         &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
     };
-    pfloat* params_memory_iterator = params_memory;
+    pfloat* params_memory_iterator = params_memory->data();
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         *(ptrs[i]) = params_memory_iterator;
         params_memory_iterator += param_sizes[i];
@@ -633,19 +634,19 @@ typedef struct {
     pfloat* losses; // (B, T)
 } ActivationTensors;
 
-pfloat* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) {
+std::vector<pfloat>* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) {
     size_t num_activations = 0;
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
         num_activations += act_sizes[i];
     }
-    pfloat* acts_memory = (pfloat*)mallocCheck(num_activations * sizeof(pfloat));
+    std::vector<pfloat>* acts_memory = new std::vector<pfloat>(num_activations);
     pfloat** ptrs[] = {
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->qkv, &acts->atty,
         &acts->preatt, &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
         &acts->ln2_rstd, &acts->fch, &acts->fch_gelu, &acts->fcproj, &acts->residual3, &acts->lnf,
         &acts->lnf_mean, &acts->lnf_rstd, &acts->logits, &acts->probs, &acts->losses
     };
-    pfloat* acts_memory_iterator = acts_memory;
+    pfloat* acts_memory_iterator = acts_memory->data();
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
         *(ptrs[i]) = acts_memory_iterator;
         acts_memory_iterator += act_sizes[i];
@@ -658,22 +659,22 @@ typedef struct {
     // the weights (parameters) of the model, and their sizes
     ParameterTensors params;
     size_t param_sizes[NUM_PARAMETER_TENSORS];
-    pfloat* params_memory;
+    std::vector<pfloat>* params_memory;
     size_t num_parameters;
     // gradients of the weights
     ParameterTensors grads;
-    pfloat* grads_memory;
+    std::vector<pfloat>* grads_memory;
     // buffers for the AdamW optimizer
     pfloat* m_memory;
     pfloat* v_memory;
     // the activations of the model, and their sizes
     ActivationTensors acts;
     size_t act_sizes[NUM_ACTIVATION_TENSORS];
-    pfloat* acts_memory;
+    std::vector<pfloat>* acts_memory;
     size_t num_activations;
     // gradients of the activations
     ActivationTensors grads_acts;
-    pfloat* grads_acts_memory;
+    std::vector<pfloat>* grads_acts_memory;
     // other run state configuration
     int batch_size; // the batch size (B) of current forward pass
     int seq_len; // the sequence length (T) of current forward pass
@@ -823,13 +824,14 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
     // allocate and random init the memory for all the parameters with GPT-2 schema
     // weights ~N(0, 0.02), biases 0, c_proj weights ~N(0, 0.02/(2*L)**0.5)
     // NOTE: assuming all parameters are of the type pfloatX, could be relaxed later
-    pfloat* params_memory_cpu = (pfloat*)mallocCheck(num_parameters_bytes);
+    //pfloat* params_memory_cpu = (pfloat*)mallocCheck(num_parameters_bytes);
+    std::vector<pfloat>* params_memory_cpu = model->params_memory;
     //memset(params_memory_cpu, 0, num_parameters_bytes);
-    for (size_t i=0; i<n_weights; i++) {
+    /*for (size_t i=0; i<n_weights; i++) {
 	if (i%1000000==0)
 	    printf("set params_memory_cpu[%lu] = 0\n",i);
 	params_memory_cpu[i] = pfloat(0);
-    }
+	}*/
     // fill in all the weights with random values
     pfloat residual_scale = 1.0f / sqrt(2.0f * model->config.num_layers);
     // we have to init all these tensors exactly in the order that PyTorch initializes them
@@ -842,7 +844,7 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
             // the layernorm parameters are all initialized to 1
             if (l == 0 && (i == 2 || i == 8 || i == 14)) { // only at l = 0 to init these just once
                 for (size_t j = 0; j < model->param_sizes[i]; j++) {
-                    params_memory_cpu[offset + j] = 1.0f;
+                    params_memory_cpu->at(offset + j) = 1.0f;
                 }
             }
             // weights tensors are handled here
@@ -866,14 +868,11 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
                 // okay let's draw the random numbers and write them
                 //pfloat *fp32_buffer = (pfloat*)mallocCheck(n * sizeof(pfloat));
 		std::vector<pfloat> vpfBuffer (n);
-		printf("call pnormal_ with n=%d\n",n);
                 pnormal_(vpfBuffer.data(), n, 0.0f, scale, &init_rng_2, params_memory_active+offset+layer_offset);
-		printf("did pnormal_\n");
                 for (size_t j = 0; j < n; j++) {
 		    size_t i_pmc = offset+layer_offset+j;
 		    if (params_memory_active[i_pmc]) {
-			printf("set params_memory_cpu[%lu] to %.8e\n",i_pmc,vpfBuffer[j].convert_to<float>());
-			params_memory_cpu[i_pmc] = vpfBuffer[j];
+			params_memory_cpu->at(i_pmc) = vpfBuffer[j];
 		    }
 		    /*else { // set inactive weights to 0
 			params_memory_cpu[i_pmc] = 0.0f;
@@ -896,14 +895,14 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
 	    printf("i_cp = %d\n",i);
 	    uint32_t weight_index = ((uint32_t*)cp)[2*i];
 	    pfloat weight_value = ((float*)cp)[2*i+1];
-	    if (params_memory_cpu[weight_index] != 0.0f)
+	    if (params_memory_cpu->at(weight_index) != 0.0f)
 		printf("i=%d weight_index=%u, weight_value=%.8e\n",i,weight_index,weight_value.convert_to<float>());
-	    params_memory_cpu[weight_index] = weight_value;
+	    params_memory_cpu->at(weight_index) = weight_value;
 	}
     }
     // copy them to the model
-    memcpy(model->params_memory, params_memory_cpu, num_parameters_bytes);
-    free(params_memory_cpu);
+    //memcpy(model->params_memory, params_memory_cpu, num_parameters_bytes);
+    //free(params_memory_cpu);
     //model->params_memory = params_memory_cpu;
 }
 
@@ -1063,12 +1062,12 @@ void gpt2_zero_grad(GPT2 *model) {
     if(model->grads_memory != NULL) {
 	//memset(model->grads_memory, 0, model->num_parameters * sizeof(pfloat));
 	for (size_t i=0; i<model->num_parameters; i++)
-	    (model->grads_memory)[i] = 0;
+	    (model->grads_memory)->at(i) = 0;
     }
     if(model->grads_acts_memory != NULL) {
 	//memset(model->grads_acts_memory, 0, model->num_activations * sizeof(pfloat));
 	for (size_t i=0; i<model->num_activations; i++)
-	    (model->grads_acts_memory)[i] = 0;
+	    (model->grads_acts_memory)->at(i) = 0;
     }
 }
 
@@ -1195,8 +1194,8 @@ void gpt2_update(GPT2 *model, pfloat learning_rate, pfloat beta1, pfloat beta2, 
     for (size_t i = 0; i < model->num_parameters; i++) {
 	if (!model->params_memory_active[i])
 	    continue;
-        pfloat param = model->params_memory[i];
-        pfloat grad = model->grads_memory[i];
+        pfloat param = model->params_memory->at(i);
+        pfloat grad = model->grads_memory->at(i);
 
         // update the first moment (momentum)
         pfloat m = beta1 * model->m_memory[i] + (1.0f - beta1) * grad;
@@ -1211,17 +1210,17 @@ void gpt2_update(GPT2 *model, pfloat learning_rate, pfloat beta1, pfloat beta2, 
         // update
         model->m_memory[i] = m;
         model->v_memory[i] = v;
-        model->params_memory[i] -= learning_rate * (m_hat / (sqrt(v_hat) + eps) + weight_decay * param);
+        model->params_memory->at(i) -= learning_rate * (m_hat / (sqrt(v_hat) + eps) + weight_decay * param);
     }
 }
 
 void gpt2_free(GPT2 *model) {
-    free(model->params_memory);
-    free(model->grads_memory);
+    model->params_memory->clear();
+    model->grads_memory->clear();
     free(model->m_memory);
     free(model->v_memory);
-    free(model->acts_memory);
-    free(model->grads_acts_memory);
+    model->acts_memory->clear();
+    model->grads_acts_memory->clear();
     free(model->inputs);
     free(model->targets);
     free(model->active_weights);
@@ -1297,7 +1296,7 @@ int gpt2_train(pfloat* ploss, uchar** p_weight_state, uchar* block_hash, uchar* 
     float* params_active = (float*)malloc(model.n_active_weights*4);
     for (int i=0; i<model.n_active_weights; i++) {
 	//params_active[i] = model.params_memory+model.active_weights[i];
-	params_active[i] = model.params_memory[(model.active_weights[i])].convert_to<float>();
+	params_active[i] = model.params_memory->at(model.active_weights[i]).convert_to<float>();
     }
 
     size_t weight_state_size = model.n_active_weights*8+32;
@@ -1349,7 +1348,7 @@ int gpt2_train(pfloat* ploss, uchar** p_weight_state, uchar* block_hash, uchar* 
                 dataloader_next_batch(&val_loader);
 		printf("inputs:");
 		for (int j=0; j<B*T; j++) {
-		    printf(" %d",train_loader.inputs[j]);
+		    printf(" %d",val_loader.inputs[j]);
 		}
 		printf("\n");
 		gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);

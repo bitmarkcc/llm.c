@@ -242,7 +242,7 @@ endif
 .PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu profile_gpt2cu
 
 # Add targets
-TARGETS = train_gpt2 test_gpt2 train_gpt2_btm
+TARGETS = train_gpt2 test_gpt2 train_gpt2_btm test2
 
 # Conditional inclusion of CUDA targets
 ifeq ($(NVCC),)
@@ -264,6 +264,9 @@ train_gpt2_btm: train_gpt2_btm.c
 
 test_gpt2: test_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
+
+test2: test2.c
+	$(CXX) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) -lmpfr $(OUTPUT_FILE)
 
 $(NVCC_CUDNN): llmc/cudnn_att.cpp
 	$(NVCC) -c $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_INCLUDES) -o $@
