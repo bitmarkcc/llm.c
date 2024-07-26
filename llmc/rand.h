@@ -84,7 +84,9 @@ Both output:
 #define RAND_H
 
 #include <math.h>
+#ifdef LLMC_PFLOAT
 #include "pfloat.h"
+#endif
 
 #define MERSENNE_STATE_M 397u
 #define MERSENNE_STATE_N 624u
@@ -153,19 +155,19 @@ inline unsigned long long randint64(mt19937_state* state) {
 inline float randfloat32(mt19937_state* state) { // this is in [0,1) ?
     return (randint32(state) & ((1ull << 24) - 1)) * (1.0f / (1ull << 24));
 }
-
+#ifdef LLMC_PFLOAT
 inline pfloat randpfloat32(mt19937_state* state) {
     return (randint32(state) & ((1ull << 24) - 1)) * (pfloat(1) / (1ull << 24));
 }
-
+#endif
 inline double randfloat64(mt19937_state* state) {
     return (randint64(state) & ((1ull << 53) - 1)) * (1.0 / (1ull << 53));
 }
-
+#ifdef LLMC_PFLOAT
 inline pdouble randpfloat64(mt19937_state* state) {
     return (randint64(state) & ((1ull << 53) - 1)) * (pdouble(1) / (1ull << 53));
 }
-
+#endif
 void uniform_(float* data, unsigned int numel, float from, float to, mt19937_state* state) {
     for (unsigned int t = 0; t < numel; t++) {
         data[t] = randfloat32(state) * (to - from) + from;
@@ -228,7 +230,7 @@ void normal_(float* data, unsigned int numel, float mean, float std, mt19937_sta
         }
     }
 }
-
+#ifdef LLMC_PFLOAT
 void pnormal_fill_16(pfloat* data, pfloat mean, pfloat std) {
     #define EPSILONE 1e-12f
     for (unsigned int t = 0; t < 8; t++) {
@@ -288,7 +290,7 @@ void pnormal_(pfloat* data, unsigned int numel, pfloat mean, pfloat std, mt19937
         }
     }
 }
-
+#endif
 void init_identity_permutation(int *data, int numel) {
     for (int i = 0; i < numel; i++) {
         data[i] = i;
