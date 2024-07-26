@@ -890,7 +890,9 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
 	printf("Warning: The size of the checkpoint data is not a multiple of 8. Ignoring it.\n");
     }
     else {
-	size_t n_cp_weights = (cp_bytes-32)/8;
+	size_t n_cp_weights = 0;
+	if (cp_bytes>0)
+	    n_cp_weights = (cp_bytes-32)/8;
 	for (int i=0; i<n_cp_weights; i++) {
 	    uint32_t weight_index = ((uint32_t*)(cp+32))[2*i];
 	    pfloat weight_value = ((float*)(cp+32))[2*i+1];
