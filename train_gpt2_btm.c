@@ -665,8 +665,8 @@ typedef struct {
     ParameterTensors grads;
     std::vector<pfloat>* grads_memory;
     // buffers for the AdamW optimizer
-    pfloat* m_memory;
-    pfloat* v_memory;
+    std::vector<pfloat>* m_memory;
+    std::vector<pfloat>* v_memory;
     // the activations of the model, and their sizes
     ActivationTensors acts;
     size_t act_sizes[NUM_ACTIVATION_TENSORS];
@@ -892,7 +892,6 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
     else {
 	size_t n_cp_weights = cp_bytes/8;
 	for (int i=0; i<n_cp_weights; i++) {
-	    printf("i_cp = %d\n",i);
 	    uint32_t weight_index = ((uint32_t*)cp)[2*i];
 	    pfloat weight_value = ((float*)cp)[2*i+1];
 	    if (params_memory_cpu->at(weight_index) != 0.0f)
@@ -1187,8 +1186,10 @@ void gpt2_update(GPT2 *model, pfloat learning_rate, pfloat beta1, pfloat beta2, 
     
     // lazily allocate the memory for m_memory and v_memory
     if (model->m_memory == NULL) {
-        model->m_memory = (pfloat*)calloc(model->num_parameters, sizeof(pfloat));
-        model->v_memory = (pfloat*)calloc(model->num_parameters, sizeof(pfloat));
+        //model->m_memory = (pfloat*)calloc(model->num_parameters, sizeof(pfloat));
+        //model->v_memory = (pfloat*)calloc(model->num_parameters, sizeof(pfloat));
+	model->m_memory = new std::vector<pfloat>(model->num_parameters);
+	model->v_memory = new std::vector<pfloat>(model->num_parameters);
     }
 
     for (size_t i = 0; i < model->num_parameters; i++) {
@@ -1198,9 +1199,9 @@ void gpt2_update(GPT2 *model, pfloat learning_rate, pfloat beta1, pfloat beta2, 
         pfloat grad = model->grads_memory->at(i);
 
         // update the first moment (momentum)
-        pfloat m = beta1 * model->m_memory[i] + (1.0f - beta1) * grad;
+        pfloat m = beta1 * model->m_memory->at(i) + (1.0f - beta1) * grad;
         // update the second moment (RMSprop)
-        pfloat v = beta2 * model->v_memory[i] + (1.0f - beta2) * grad * grad;
+        pfloat v = beta2 * model->v_memory->at(i) + (1.0f - beta2) * grad * grad;
         // bias-correct both moments
         pfloat m_hat = m / (1.0f - pow(beta1, t));
         pfloat v_hat = v / (1.0f - pow(beta2, t));
@@ -1208,19 +1209,25 @@ void gpt2_update(GPT2 *model, pfloat learning_rate, pfloat beta1, pfloat beta2, 
 	//printf("update param %lu (%.2e) with m_hat = %.2e (grad %.2e)\n",i,param,m_hat,grad);
 
         // update
-        model->m_memory[i] = m;
-        model->v_memory[i] = v;
+        model->m_memory->at(i) = m;
+        model->v_memory->at(i) = v;
         model->params_memory->at(i) -= learning_rate * (m_hat / (sqrt(v_hat) + eps) + weight_decay * param);
     }
 }
 
 void gpt2_free(GPT2 *model) {
     model->params_memory->clear();
-    model->grads_memory->clear();
-    free(model->m_memory);
-    free(model->v_memory);
-    model->acts_memory->clear();
-    model->grads_acts_memory->clear();
+    printf("clear grads_memory\n");
+    if (model->grads_memory) model->grads_memory->clear();
+    printf("clear m_memory\n");
+    if (model->m_memory) model->m_memory->clear();
+    printf("clear v_memory\n");
+    if (model->v_memory) model->v_memory->clear();
+    printf("clear acts_memory\n");
+    if (model->acts_memory) model->acts_memory->clear();
+    printf("clear grads_acts_memory\n");
+    if (model->grads_acts_memory) model->grads_acts_memory->clear();
+    printf("gpt2_free(): free inputs\n");
     free(model->inputs);
     free(model->targets);
     free(model->active_weights);
@@ -1306,7 +1313,7 @@ int gpt2_train(pfloat* ploss, uchar** p_weight_state, uchar* block_hash, uchar* 
     
     // train
     struct timespec start, end;
-    int n_steps = 40;
+    int n_steps = 20;
     for (int step = 0; step <= n_steps; step++) {
 
         // once in a while estimate the validation loss
@@ -1319,7 +1326,7 @@ int gpt2_train(pfloat* ploss, uchar** p_weight_state, uchar* block_hash, uchar* 
 		memcpy(weight_state+32+i*8,model.active_weights+i,4);
 		memcpy(weight_state+32+i*8+4,params_active+i,4); // todo fix
 	    }
-	    printf("Do SHA256 of:\n");
+	    /*	    printf("Do SHA256 of:\n");
 	    for (int i=0; i<32; i++) {
 		printf(" %02x",weight_state[i]);
 	    }
@@ -1328,7 +1335,7 @@ int gpt2_train(pfloat* ploss, uchar** p_weight_state, uchar* block_hash, uchar* 
 		printf("%u ",*((uint32_t*)(weight_state+32+i*8)));
 		printf("%.8e\n",*((float*)(weight_state+32+i*8+4)));
 	    }
-	    printf("\n");
+	    printf("\n");*/
 	    SHA256(weight_state,weight_state_size,(uchar*)hash);
 	    printf("hash =");
 	    for (int i=0; i<4; i++)
@@ -1472,7 +1479,7 @@ int main(int argc, char** argv) {
     if (argc>4)
 	rng_seed_offset = atoi(argv[4]);
 
-    size_t n_active_bytes = n_active_weights*8;
+    size_t weight_state_bytes = n_active_weights*8; // not including block hash
     
     const char* cpfname = "btm-cp.bin"; // checkpoint file name
     FILE* cpf = fopen(cpfname,"rb");
@@ -1490,20 +1497,25 @@ int main(int argc, char** argv) {
 
     printf("cp_bytes = %lu\n",cp_bytes);
 
-    int n_sweeps = 10; // this squared is the number of training calls
+    int n_sweeps = 1; // this squared is the number of training calls (set to 10)
     pfloat loss = -1.0f;
     uchar* weight_state = 0;
     pfloat best_loss = FLT_MAX;
-    uchar* best_weight_state = (uchar*)malloc(n_active_bytes);
+    uchar* best_weight_state = (uchar*)malloc(weight_state_bytes);
     for (int i=0; i<n_sweeps; i++) {
 	for (int j=0; j<n_sweeps; j++) {
 	    int ret = gpt2_train(&loss,&weight_state,block_hash,cp,cp_bytes,depth,n_active_weights,rng_seed_offset+i,rng_seed_offset+j);
 	    printf("main() seed = (%u,%u) loss = %f\n",rng_seed_offset+i,rng_seed_offset+j,loss.convert_to<float>());
 	    if (loss<best_loss) {
 		best_loss = loss;
-		memcpy(best_weight_state,weight_state,n_active_bytes);
+		if (weight_state == 0) {
+		    printf("weight_state null\n");
+		}
+		else {
+		    memcpy(best_weight_state,weight_state,weight_state_bytes);
+		}
 	    }
-	    if (weight_state) free(weight_state);
+	    if ((weight_state-32)&&weight_state!=0) free(weight_state-32); // it has the block hash
 	}
     }
     printf("best_loss = %f\n",best_loss.convert_to<float>());
@@ -1519,7 +1531,7 @@ int main(int argc, char** argv) {
 	}
 	printf(" ...\n");
 
-	size_t ret = fwrite(best_weight_state,1,n_active_bytes,cpf);
+	size_t ret = fwrite(best_weight_state,1,weight_state_bytes,cpf);
 	printf("wrote %lu bytes to file %s\n",ret,cpfname);
 	fclose(cpf);
     }
