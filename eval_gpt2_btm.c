@@ -687,66 +687,7 @@ typedef struct {
     bool* params_memory_active;
 } GPT2;
 
-void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
-
-    // read in model from a checkpoint file
-    FILE *model_file = fopenCheck(checkpoint_path, "rb");
-    if (model_file == NULL) { printf("Error opening model file\n"); exit(1); }
-    int model_header[256];
-    freadCheck(model_header, sizeof(int), 256, model_file);
-    if (model_header[0] != 20240326) { printf("Bad magic model file\n"); exit(1); }
-    if (model_header[1] != 3) {
-        printf("Bad version in model file\n");
-        printf("---> HINT: try to re-run `python train_gpt2.py`\n");
-        exit(1);
-    }
-
-    // read in hyperparameters
-    size_t maxT, V, Vp, L, NH, C; // size_t to prevent int overflow
-    model->config.max_seq_len = maxT = model_header[2];
-    model->config.vocab_size = V = model_header[3];
-    model->config.num_layers = L = model_header[4];
-    model->config.num_heads = NH = model_header[5];
-    model->config.channels = C = model_header[6];
-    model->config.padded_vocab_size = Vp = model_header[7];
-    printf("[GPT-2]\n");
-    printf("max_seq_len: %zu\n", maxT);
-    printf("vocab_size: %zu\n", V);
-    printf("padded_vocab_size: %zu\n", Vp);
-    printf("num_layers: %zu\n", L);
-    printf("num_heads: %zu\n", NH);
-    printf("channels: %zu\n", C);
-
-    // allocate space for all the parameters and read them in
-    fill_in_parameter_sizes(model->param_sizes,  model->config);
-
-    // count the number of parameters
-    size_t num_parameters = 0;
-    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        num_parameters += model->param_sizes[i];
-    }
-    printf("num_parameters: %zu\n", num_parameters);
-    model->num_parameters = num_parameters;
-
-    // read in all the parameters from file
-    model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes);
-    freadCheck(model->params_memory, sizeof(pfloat), num_parameters, model_file);
-    fcloseCheck(model_file);
-
-    // other inits
-    model->acts_memory = NULL;
-    model->grads_memory = NULL;
-    model->m_memory = NULL;
-    model->v_memory = NULL;
-    model->grads_acts_memory = NULL;
-    model->inputs = NULL;
-    model->targets = NULL;
-    model->batch_size = 0;
-    model->seq_len = 0;
-    model->mean_loss = -1.0f; // -1.0f will designate no loss
-}
-
-void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, unsigned int rng_seed_1, unsigned int rng_seed_2, uchar* cp, size_t cp_bytes) {
+void gpt2_build_from_checkpoint(GPT2 *model, int depth, uchar* cp, size_t cp_bytes) {
     // init random (training from scratch)
 
     // parameterize the size of gpt2 based only on the depth of the model (num_layers)
@@ -786,41 +727,13 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
     model->batch_size = 0;
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f will designate no loss
-
-    //size_t n_active_weights = 4000; // number of weights that will be adjusted (change to 4000)
-    printf("n_active_weights = %lu\n",n_active_weights);
-    mt19937_state init_rng_1;
-    manual_seed(&init_rng_1, rng_seed_1);
-
-    // get a random subset of weights
-    uint32_t* active_weights = (uint32_t*)malloc(n_active_weights*sizeof(uint32_t));
-    size_t n_weights = model->num_parameters;
-    for (size_t i=0; i<n_active_weights; i++)
-	active_weights[i] = n_weights; // dummy value
-    bool* params_memory_active = (bool*)malloc(sizeof(bool)*n_weights);
-    for (size_t i=0; i<n_weights; i++)
-	params_memory_active[i] = false;
-    int i_active = 0;
-    printf("rng_seed_1 = %u\n",rng_seed_1);
-    for (size_t i=0; i<n_active_weights; i++) {
-	// get random number from 0 to n_weights-1, not chosen before
-	while (true) {
-	    uint32_t rand_weight = (uint32_t)(randpfloat32(&init_rng_1)*n_weights);
-	    if (!in_uint_array(active_weights,n_active_weights,rand_weight)) {
-		active_weights[i] = rand_weight;
-		params_memory_active[rand_weight] = true;
-		if (i%10000==0) printf("active_weights[%lu] = %u\n",i,active_weights[i]);
-		break;
-	    }
-	}
-    }
     
-    model->active_weights = active_weights;
-    model->n_active_weights = n_active_weights;
-    model->params_memory_active = params_memory_active;
+    model->active_weights = NULL;
+    model->n_active_weights = 0;
+    model->params_memory_active = NULL;
 
-    mt19937_state init_rng_2;
-    manual_seed(&init_rng_2, rng_seed_2);
+    //mt19937_state init_rng_2;
+    //manual_seed(&init_rng_2, rng_seed_2);
     // allocate and random init the memory for all the parameters with GPT-2 schema
     // weights ~N(0, 0.02), biases 0, c_proj weights ~N(0, 0.02/(2*L)**0.5)
     // NOTE: assuming all parameters are of the type pfloatX, could be relaxed later
@@ -867,18 +780,18 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
                 pfloat scale = (i == 6 || i == 12) ? 0.02f * residual_scale : pfloat(0.02f);
                 // okay let's draw the random numbers and write them
                 //pfloat *fp32_buffer = (pfloat*)mallocCheck(n * sizeof(pfloat));
-		std::vector<pfloat> vpfBuffer (n);
-                pnormal_(vpfBuffer.data(), n, 0.0f, scale, &init_rng_2, params_memory_active+offset+layer_offset);
+		/*std::vector<pfloat> vpfBuffer (n);
+		  pnormal_(vpfBuffer.data(), n, 0.0f, scale, &init_rng_2, params_memory_active+offset+layer_offset);
                 for (size_t j = 0; j < n; j++) {
-		    size_t i_pmc = offset+layer_offset+j;
-		    if (params_memory_active[i_pmc]) {
+		size_t i_pmc = offset+layer_offset+j;*/
+		    /*if (params_memory_active[i_pmc]) {
 			params_memory_cpu->at(i_pmc) = vpfBuffer[j];
-		    }
+			}*/
 		    /*else { // set inactive weights to 0
 			params_memory_cpu[i_pmc] = 0.0f;
 			}*/
-                }
-		vpfBuffer.clear();
+                /*}
+		  vpfBuffer.clear();*/
                 //free(fp32_buffer);
             }
             offset += model->param_sizes[i];
@@ -1268,11 +1181,11 @@ int sample_mult(pfloat* probabilities, int n, pfloat coin) {
 // ----------------------------------------------------------------------------
 // main training loop
 //int main(int argc, char** argv) {
-int gpt2_train(pfloat* ploss, uchar** p_weight_state, uchar* block_hash, uchar* cp, size_t cp_bytes, int depth, size_t n_active_weights, unsigned int rng_seed_1, unsigned int rng_seed_2) {
+int gpt2_eval(pfloat* ploss, uchar* block_hash, uchar* cp, size_t cp_bytes, int depth, size_t n_active_weights, unsigned int rng_seed_1, unsigned int rng_seed_2) {
 
     GPT2 model;
     //gpt2_build_from_checkpoint(&model, "gpt2_124M.bin"); // to build from CP
-    gpt2_build_from_random(&model,depth,n_active_weights,rng_seed_1,rng_seed_2,cp,cp_bytes);
+    gpt2_build_from_checkpoint(&model,depth,cp,cp_bytes);
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
     const char* tiny_stories_train = "dev/data/tinystories/TinyStories_train.bin";
@@ -1300,25 +1213,6 @@ int gpt2_train(pfloat* ploss, uchar** p_weight_state, uchar* block_hash, uchar* 
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
     const int genT = 64; // number of steps of inference we will do
 
-    // pointer to active weights/params
-    //pfloat** params_active = (pfloat**)malloc(model.n_active_weights*sizeof(pfloat*));
-    float* params_active = (float*)malloc(model.n_active_weights*4);
-    for (int i=0; i<model.n_active_weights; i++) {
-	//params_active[i] = model.params_memory+model.active_weights[i];
-	params_active[i] = model.params_memory->at(model.active_weights[i]).convert_to<float>();
-    }
-
-    size_t weight_state_size = model.n_active_weights*8+32;
-    // <block_hash><weightIndex1><weightValue1>...<weightIndexN><weightValueN>
-    uchar* weight_state = (uchar*)malloc(weight_state_size);
-    if (block_hash) {
-	memcpy(weight_state,block_hash,32);
-    }
-    else {
-	memset(weight_state,255,32);
-    }
-    
-    // train
     struct timespec start, end;
     int n_steps = 0;
     for (int step = 0; step <= n_steps; step++) {
@@ -1329,10 +1223,6 @@ int gpt2_train(pfloat* ploss, uchar** p_weight_state, uchar* block_hash, uchar* 
 	    // hash the active weights
 	    unsigned int hash [8]; // hash is 256 bit = 8*32 bit
 	    unsigned int hash2 [8];
-	    for (int i=0; i<model.n_active_weights; i++) {
-		memcpy(weight_state+32+i*8,model.active_weights+i,4);
-		memcpy(weight_state+32+i*8+4,params_active+i,4); // todo fix
-	    }
 	    /*	    printf("Do SHA256 of:\n");
 	    for (int i=0; i<32; i++) {
 		printf(" %02x",weight_state[i]);
@@ -1343,7 +1233,7 @@ int gpt2_train(pfloat* ploss, uchar** p_weight_state, uchar* block_hash, uchar* 
 		printf("%.8e\n",*((float*)(weight_state+32+i*8+4)));
 	    }
 	    printf("\n");*/
-	    SHA256(weight_state,weight_state_size,(uchar*)hash);
+	    SHA256(cp,cp_bytes,(uchar*)hash);
 	    printf("hash =");
 	    for (int i=0; i<4; i++)
 		printf(" %u",((uchar*)hash)[i]);
@@ -1372,13 +1262,11 @@ int gpt2_train(pfloat* ploss, uchar** p_weight_state, uchar* block_hash, uchar* 
             printf("val loss %f\n", val_loss.convert_to<float>());
 	    if (step == n_steps) { // return results
 		*ploss = val_loss;
-		*p_weight_state = weight_state;
 		dataloader_free(&train_loader);
 		dataloader_free(&val_loader);
 		tokenizer_free(&tokenizer);
 		gpt2_free(&model);
 		free(gen_tokens);
-		free(params_active);
 		return 0;
 	    }
         }
@@ -1438,7 +1326,6 @@ int gpt2_train(pfloat* ploss, uchar** p_weight_state, uchar* block_hash, uchar* 
     tokenizer_free(&tokenizer);
     gpt2_free(&model);
     free(gen_tokens);
-    free(params_active);
     return 0;
 }
 int main(int argc, char** argv) {
@@ -1511,22 +1398,11 @@ int main(int argc, char** argv) {
     uchar* best_weight_state = (uchar*)malloc(weight_state_bytes);
     for (int i=0; i<n_sweeps; i++) {
 	for (int j=0; j<n_sweeps; j++) {
-	    int ret = gpt2_train(&loss,&weight_state,block_hash,cp,cp_bytes,depth,n_active_weights,rng_seed_offset+i,rng_seed_offset+j);
+	    int ret = gpt2_eval(&loss,block_hash,cp,cp_bytes,depth,n_active_weights,rng_seed_offset+i,rng_seed_offset+j);
 	    printf("main() seed = (%u,%u) loss = %f\n",rng_seed_offset+i,rng_seed_offset+j,loss.convert_to<float>());
-	    if (loss<best_loss) {
-		best_loss = loss;
-		if (weight_state == 0) {
-		    printf("weight_state null\n");
-		}
-		else {
-		    memcpy(best_weight_state,weight_state,weight_state_bytes);
-		}
-	    }
-	    if ((weight_state)&&weight_state!=0) free(weight_state); // it has the block hash
 	}
     }
-    printf("best_loss = %f\n",best_loss.convert_to<float>());
-    cpf = fopen(cpfname,"ab");
+    /*    cpf = fopen(cpfname,"ab");
     if (!cpf) {
 	printf("error opening file %s for writing\n",cpfname);
 	exit(1);
@@ -1541,7 +1417,7 @@ int main(int argc, char** argv) {
 	size_t ret = fwrite(best_weight_state,1,weight_state_bytes,cpf);
 	printf("wrote %lu bytes to file %s\n",ret,cpfname);
 	fclose(cpf);
-    }
+	}*/
     if (best_weight_state) free(best_weight_state);
     if (block_hash) free(block_hash);
     return 0;
