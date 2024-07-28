@@ -803,15 +803,17 @@ void gpt2_build_from_checkpoint(GPT2 *model, int depth, uchar* cp, size_t cp_byt
 	printf("Warning: The size of the checkpoint data is not a multiple of 8. Ignoring it.\n");
     }
     else {
-	size_t n_cp_weights = 0;
-	if (cp_bytes>0)
-	    n_cp_weights = (cp_bytes-32)/8;
-	for (int i=0; i<n_cp_weights; i++) {
-	    uint32_t weight_index = ((uint32_t*)(cp+32))[2*i];
-	    pfloat weight_value = ((float*)(cp+32))[2*i+1];
-	    if (params_memory_cpu->at(weight_index) != 0.0f)
-		printf("i=%d weight_index=%u, weight_value=%.8e\n",i,weight_index,weight_value.convert_to<float>());
-	    params_memory_cpu->at(weight_index) = weight_value;
+	size_t bytes_scanned = 0;
+	while (bytes_scanned<cp_bytes) {
+	    size_t n_cp_weights = *((size_t*)(cp+bytes_scanned+32));
+	    for (int i=0; i<n_cp_weights; i++) {
+		uint32_t weight_index = ((uint32_t*)(cp+bytes_scanned+40))[2*i];
+		pfloat weight_value = ((float*)(cp+bytes_scanned+40))[2*i+1];
+		if (params_memory_cpu->at(weight_index) != 0.0f)
+		    printf("i=%d weight_index=%u, weight_value=%.8e\n",i,weight_index,weight_value.convert_to<float>());
+		params_memory_cpu->at(weight_index) = weight_value;
+	    }
+	    bytes_scanned += 40+n_cp_weights*8;
 	}
     }
     // copy them to the model
@@ -1280,7 +1282,7 @@ int gpt2_eval(pfloat* ploss, uchar* block_hash, uchar* cp, size_t cp_bytes, int 
 		tokenizer_free(&tokenizer);
 		gpt2_free(&model);
 		free(gen_tokens);
-		free(weight_state);
+		if (weight_state) free(weight_state);
 		return 0;
 	    }
         }
@@ -1340,15 +1342,19 @@ int gpt2_eval(pfloat* ploss, uchar* block_hash, uchar* cp, size_t cp_bytes, int 
     tokenizer_free(&tokenizer);
     gpt2_free(&model);
     free(gen_tokens);
-    free(weight_state);
+    if (weight_state) free(weight_state);
     return 0;
 }
 int main(int argc, char** argv) {
-    
+
+    // system assumptions (can be relaxed later)
     assert(CHAR_BIT == 8);
     assert(CHAR_BIT * sizeof(float) == 32);
     assert(CHAR_BIT * sizeof(unsigned int) == 32);
     assert(CHAR_BIT * sizeof(size_t) == 64);
+    const int n = 1;
+    assert( (*(char*)&n) != 0 ); // little endian
+    
 
     //boost::multiprecision::mpfr_float::default_precision(8);
     std::cout << std::fixed;

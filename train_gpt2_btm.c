@@ -878,15 +878,17 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
     if (cp_bytes % 8 != 0) {
 	printf("Warning: The size of the checkpoint data is not a multiple of 8. Ignoring it.\n");
     }
-    size_t bytes_scanned = 0;
-    while (bytes_scanned<cp_bytes) {
-	size_t n_cp_weights = *((size_t*)(cp+bytes_scanned+32));
-	for (int i=0; i<n_cp_weights; i++) {
-	    uint32_t weight_index = ((uint32_t*)(cp+40))[2*i];
-	    float weight_value = ((float*)(cp+40))[2*i+1];
-	    params_memory_cpu[weight_index] = weight_value;
+    else {
+	size_t bytes_scanned = 0;
+	while (bytes_scanned<cp_bytes) {
+	    size_t n_cp_weights = *((size_t*)(cp+bytes_scanned+32));
+	    for (int i=0; i<n_cp_weights; i++) {
+		uint32_t weight_index = ((uint32_t*)(cp+bytes_scanned+40))[2*i];
+		float weight_value = ((float*)(cp+bytes_scanned+40))[2*i+1];
+		params_memory_cpu[weight_index] = weight_value;
+	    }
+	    bytes_scanned += 40+n_cp_weights*8;
 	}
-	bytes_scanned += 40+n_cp_weights*8;
     }
     
     // copy them to the model
@@ -1287,7 +1289,7 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
     else {
 	memset(weight_state,255,32);
     }
-    memcpy(weight_state+32,&(model.num_parameters),8);
+    memcpy(weight_state+32,&(model.n_active_weights),8);
     
     // train
     struct timespec start, end;
@@ -1405,6 +1407,8 @@ int main(int argc, char** argv) {
     assert(CHAR_BIT * sizeof(float) == 32);
     assert(CHAR_BIT * sizeof(unsigned int) == 32);
     assert(CHAR_BIT * sizeof(size_t) == 64);
+    const int n = 1;
+    assert( (*(char*)&n) != 0 );
 
     struct timespec ts;
     timespec_get(&ts,TIME_UTC);
@@ -1448,7 +1452,7 @@ int main(int argc, char** argv) {
 	fclose(cpf);
     }
 
-    int n_sweeps = 8; // this squared is the number of training calls
+    int n_sweeps = 4; // this squared is the number of training calls
     float loss = -1.0f;
     uchar* weight_state = 0;
     float best_loss = FLT_MAX;
