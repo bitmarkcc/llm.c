@@ -1213,6 +1213,19 @@ int gpt2_eval(pfloat* ploss, uchar* block_hash, uchar* cp, size_t cp_bytes, int 
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
     const int genT = 64; // number of steps of inference we will do
 
+    uchar* weight_state = 0;
+    size_t weight_state_bytes = 0;
+    size_t bytes_scanned = 0;
+    while (bytes_scanned < cp_bytes) {
+	size_t n_cp_weights = *((size_t*)(cp+bytes_scanned+32));
+	if (bytes_scanned+40+n_cp_weights*8 == cp_bytes) {
+	    weight_state_bytes = 40+n_cp_weights*8;
+	    weight_state = (uchar*)malloc(weight_state_bytes);
+	    memcpy(weight_state,cp+bytes_scanned,weight_state_bytes);
+	}
+	bytes_scanned += 40+8*n_cp_weights;
+    }
+
     struct timespec start, end;
     int n_steps = 0;
     for (int step = 0; step <= n_steps; step++) {
@@ -1233,7 +1246,7 @@ int gpt2_eval(pfloat* ploss, uchar* block_hash, uchar* cp, size_t cp_bytes, int 
 		printf("%.8e\n",*((float*)(weight_state+32+i*8+4)));
 	    }
 	    printf("\n");*/
-	    SHA256(cp,cp_bytes,(uchar*)hash);
+	    SHA256(weight_state,weight_state_bytes,(uchar*)hash);
 	    printf("hash =");
 	    for (int i=0; i<4; i++)
 		printf(" %u",((uchar*)hash)[i]);
@@ -1267,6 +1280,7 @@ int gpt2_eval(pfloat* ploss, uchar* block_hash, uchar* cp, size_t cp_bytes, int 
 		tokenizer_free(&tokenizer);
 		gpt2_free(&model);
 		free(gen_tokens);
+		free(weight_state);
 		return 0;
 	    }
         }
@@ -1326,6 +1340,7 @@ int gpt2_eval(pfloat* ploss, uchar* block_hash, uchar* cp, size_t cp_bytes, int 
     tokenizer_free(&tokenizer);
     gpt2_free(&model);
     free(gen_tokens);
+    free(weight_state);
     return 0;
 }
 int main(int argc, char** argv) {
@@ -1333,6 +1348,7 @@ int main(int argc, char** argv) {
     assert(CHAR_BIT == 8);
     assert(CHAR_BIT * sizeof(float) == 32);
     assert(CHAR_BIT * sizeof(unsigned int) == 32);
+    assert(CHAR_BIT * sizeof(size_t) == 64);
 
     //boost::multiprecision::mpfr_float::default_precision(8);
     std::cout << std::fixed;
@@ -1373,7 +1389,7 @@ int main(int argc, char** argv) {
     if (argc>4)
 	rng_seed_offset = atoi(argv[4]);
 
-    size_t weight_state_bytes = n_active_weights*8+32;
+    size_t weight_state_bytes = n_active_weights*8+40;
     
     const char* cpfname = "btm-cp.bin"; // checkpoint file name
     FILE* cpf = fopen(cpfname,"rb");
@@ -1409,7 +1425,7 @@ int main(int argc, char** argv) {
     }
     else {	
 	printf("weight_state =");
-	for (int i=0; i<64*8+32; i++) {
+	for (int i=0; i<64*8+40; i++) {
 	    printf(" %u",best_weight_state[i]);
 	}
 	printf(" ...\n");

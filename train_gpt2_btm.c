@@ -791,6 +791,7 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
     // get a random subset of weights
     uint32_t* active_weights = malloc(n_active_weights*sizeof(uint32_t));
     size_t n_weights = model->num_parameters;
+    printf("n_weights = %lu\n",n_weights);
     for (size_t i=0; i<n_active_weights; i++)
 	active_weights[i] = n_weights; // dummy value
     bool* params_memory_active = malloc(sizeof(bool)*n_weights);
@@ -877,15 +878,17 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
     if (cp_bytes % 8 != 0) {
 	printf("Warning: The size of the checkpoint data is not a multiple of 8. Ignoring it.\n");
     }
-    size_t n_cp_weights = 0;
-    if (cp_bytes > 0)
-	n_cp_weights = (cp_bytes-32)/8;
-    for (int i=0; i<n_cp_weights; i++) {
-	uint32_t weight_index = ((uint32_t*)(cp+32))[2*i];
-	float weight_value = ((float*)(cp+32))[2*i+1];
-	params_memory_cpu[weight_index] = weight_value;
+    size_t bytes_scanned = 0;
+    while (bytes_scanned<cp_bytes) {
+	size_t n_cp_weights = *((size_t*)(cp+bytes_scanned+32));
+	for (int i=0; i<n_cp_weights; i++) {
+	    uint32_t weight_index = ((uint32_t*)(cp+40))[2*i];
+	    float weight_value = ((float*)(cp+40))[2*i+1];
+	    params_memory_cpu[weight_index] = weight_value;
+	}
+	bytes_scanned += 40+n_cp_weights*8;
     }
-
+    
     // copy them to the model
     memcpy(model->params_memory, params_memory_cpu, num_parameters_bytes);
     free(params_memory_cpu);
@@ -1275,7 +1278,7 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
 	params_active[i] = model.params_memory+model.active_weights[i];
     }
 
-    size_t weight_state_size = model.n_active_weights*8+32;
+    size_t weight_state_size = model.n_active_weights*8+32+8;
     // <block_hash><weightIndex1><weightValue1>...<weightIndexN><weightValueN>
     uchar* weight_state = malloc(weight_state_size);
     if (block_hash) {
@@ -1284,6 +1287,7 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
     else {
 	memset(weight_state,255,32);
     }
+    memcpy(weight_state+32,&(model.num_parameters),8);
     
     // train
     struct timespec start, end;
@@ -1297,8 +1301,8 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
 	    unsigned int hash [8]; // hash is 256 bit = 8*32 bit
 	    unsigned int hash2 [8];
 	    for (int i=0; i<model.n_active_weights; i++) {
-		memcpy(weight_state+32+i*8,model.active_weights+i,4);
-		memcpy(weight_state+32+i*8+4,params_active[i],4);
+		memcpy(weight_state+40+i*8,model.active_weights+i,4);
+		memcpy(weight_state+40+i*8+4,params_active[i],4);
 	    }
 	    /*printf("Do SHA256 of: \n");
 	    for (int i=0; i<weight_state_size; i++) {
@@ -1400,6 +1404,7 @@ int main(int argc, char** argv) {
     assert(CHAR_BIT == 8);
     assert(CHAR_BIT * sizeof(float) == 32);
     assert(CHAR_BIT * sizeof(unsigned int) == 32);
+    assert(CHAR_BIT * sizeof(size_t) == 64);
 
     struct timespec ts;
     timespec_get(&ts,TIME_UTC);
@@ -1427,7 +1432,7 @@ int main(int argc, char** argv) {
     if (argc>4)
 	rng_seed_offset = atoi(argv[4]);
 
-    size_t n_active_bytes = n_active_weights*8+32;
+    size_t n_active_bytes = n_active_weights*8+32+8;
     
     const char* cpfname = "btm-cp.bin"; // checkpoint file name
     FILE* cpf = fopen(cpfname,"rb");
@@ -1467,7 +1472,7 @@ int main(int argc, char** argv) {
     }
     else {	
 	printf("weight_state =");
-	for (int i=0; i<64*8+32; i++) {
+	for (int i=0; i<64*8+40; i++) {
 	    printf(" %u",best_weight_state[i]);
 	}
 	printf(" ...\n");

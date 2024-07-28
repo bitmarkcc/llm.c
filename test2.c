@@ -8,6 +8,9 @@ std::vector<pfloat>* get_pfloat_vec(size_t n) {
 int main (int argc, char** argv) {
 
     int n = atoi(argv[1]);
+
+    printf("sizeof(pfloat) = %lu\n",sizeof(pfloat));
+    printf("sizeof(pdouble) = %lu\n",sizeof(pdouble));
     
     std::vector<pfloat>* v = get_pfloat_vec(n);
     v->at(1) = 0.5;
@@ -15,7 +18,7 @@ int main (int argc, char** argv) {
     v->at(2) = v->at(1)+v->at(3);
     printf("v elements:\n");
     for (int i=0; i<n; i++) {
-	printf("v->at(%d) = %.8e\n",i,v->at(i).convert_to<float>());
+	printf("v->at(%d) = %.8e (size %lu)\n",i,v->at(i).convert_to<float>(),sizeof(v->at(i)));
     }
     printf("p it:\n");
     pfloat* p = v->data();
