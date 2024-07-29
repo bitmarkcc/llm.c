@@ -1259,7 +1259,7 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
     int T = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
     DataLoader train_loader, val_loader; // using subsets random subsets of training set for validation
     dataloader_init(&train_loader, train_tokens, B, T, 0, 1, 1);
-    dataloader_init(&val_loader, train_tokens, B, T, 0, 1, 1); // val same as train
+    //dataloader_init(&val_loader, train_tokens, B, T, 0, 1, 1); // val same as train
         
     printf("train dataset num_batches: %zu\n", train_loader.num_tokens / (B*T));
     printf("val dataset num_batches: %zu\n", val_loader.num_tokens / (B*T));
@@ -1313,18 +1313,23 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
 	    printf("\n");*/
 	    SHA256(weight_state,weight_state_size,(uchar*)hash);
 	    SHA256((uchar*)hash,32,(uchar*)hash2);
+	    printf("hash2 = ");
+	    for (int i=0; i<4; i++)
+		printf(" %u",((uchar*)hash2)[i]);
+	    printf("\n");
 	    // set seed to first 4 bytes of hash (todo: use full 32 bytes)
+	    dataloader_init(&val_loader, train_tokens, B, T, 0, 1, 1);
 	    manual_seed(&(val_loader.shuffle_rng),*hash2);
 	  
             float val_loss = 0.0f;
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
-		/*printf("inputs:");
+		printf("inputs:");
 		for (int j=0; j<B*T; j++) {
 		    printf(" %d",train_loader.inputs[j]);
 		}
-		printf("\n");*/
+		printf("\n");
 		gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
                 val_loss += model.mean_loss;
             }
@@ -1452,7 +1457,7 @@ int main(int argc, char** argv) {
 	fclose(cpf);
     }
 
-    int n_sweeps = 4; // this squared is the number of training calls
+    int n_sweeps = 3; // this squared is the number of training calls
     float loss = -1.0f;
     uchar* weight_state = 0;
     float best_loss = FLT_MAX;

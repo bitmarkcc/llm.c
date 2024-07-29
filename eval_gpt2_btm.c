@@ -1200,7 +1200,7 @@ int gpt2_eval(pfloat* ploss, uchar* block_hash, uchar* cp, size_t cp_bytes, int 
     int T = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
     DataLoader train_loader, val_loader; // using subsets random subsets of training set for validation
     dataloader_init(&train_loader, train_tokens, B, T, 0, 1, 1);
-    dataloader_init(&val_loader, train_tokens, B, T, 0, 1, 1); // val same as train
+    //dataloader_init(&val_loader, train_tokens, B, T, 0, 1, 1); // val same as train
         
     printf("train dataset num_batches: %zu\n", train_loader.num_tokens / (B*T));
     printf("val dataset num_batches: %zu\n", val_loader.num_tokens / (B*T));
@@ -1259,6 +1259,7 @@ int gpt2_eval(pfloat* ploss, uchar* block_hash, uchar* cp, size_t cp_bytes, int 
 		printf(" %u",((uchar*)hash2)[i]);
 	    printf("\n");
 	    // set seed to first 4 bytes of hash (todo: use full 32 bytes)
+	    dataloader_init(&val_loader, train_tokens, B, T, 0, 1, 1);
 	    manual_seed(&(val_loader.shuffle_rng),*hash2);
 	  
             pfloat val_loss = 0.0f;
