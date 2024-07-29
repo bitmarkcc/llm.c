@@ -1329,7 +1329,7 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
                 dataloader_next_batch(&val_loader);
 		printf("inputs:");
 		for (int j=0; j<B*T; j++) {
-		    printf(" %d",train_loader.inputs[j]);
+		    printf(" %d",val_loader.inputs[j]);
 		}
 		printf("\n");
 		gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
