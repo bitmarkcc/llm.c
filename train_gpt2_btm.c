@@ -1257,12 +1257,12 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
     //const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
     int B = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
     int T = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
-    DataLoader train_loader, val_loader; // using subsets random subsets of training set for validation
+    DataLoader train_loader; // using subsets random subsets of training set for validation
     dataloader_init(&train_loader, train_tokens, B, T, 0, 1, 1);
     //dataloader_init(&val_loader, train_tokens, B, T, 0, 1, 1); // val same as train
         
     printf("train dataset num_batches: %zu\n", train_loader.num_tokens / (B*T));
-    printf("val dataset num_batches: %zu\n", val_loader.num_tokens / (B*T));
+    //printf("val dataset num_batches: %zu\n", val_loader.num_tokens / (B*T));
     int val_num_batches = 5;
 
     // build the Tokenizer
@@ -1319,6 +1319,7 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
 	    printf("\n");
 	    // set seed to first 4 bytes of hash (todo: use full 32 bytes)
 	    printf("dataloader_init val_loader\n");
+	    DataLoader val_loader;
 	    dataloader_init(&val_loader, train_tokens, B, T, 0, 1, 1);
 	    manual_seed(&(val_loader.shuffle_rng),*hash2);
 	  
@@ -1336,11 +1337,12 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
             }
             val_loss /= val_num_batches;
             printf("val loss %f\n", val_loss);
+	    dataloader_free(&val_loader);
 	    if (step == n_steps) { // return results
 		*ploss = val_loss;
 		*p_weight_state = weight_state;
 		dataloader_free(&train_loader);
-		dataloader_free(&val_loader);
+		//dataloader_free(&val_loader);
 		tokenizer_free(&tokenizer);
 		gpt2_free(&model);
 		free(gen_tokens);
@@ -1400,7 +1402,7 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
 
     // free
     dataloader_free(&train_loader);
-    dataloader_free(&val_loader);
+    //dataloader_free(&val_loader);
     tokenizer_free(&tokenizer);
     gpt2_free(&model);
     free(gen_tokens);
@@ -1458,7 +1460,7 @@ int main(int argc, char** argv) {
 	fclose(cpf);
     }
 
-    int n_sweeps = 3; // this squared is the number of training calls
+    int n_sweeps = 2; // this squared is the number of training calls
     float loss = -1.0f;
     uchar* weight_state = 0;
     float best_loss = FLT_MAX;
