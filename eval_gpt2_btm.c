@@ -1259,6 +1259,7 @@ int gpt2_eval(pfloat* ploss, uchar* block_hash, uchar* cp, size_t cp_bytes, int 
 		printf(" %u",((uchar*)hash2)[i]);
 	    printf("\n");
 	    // set seed to first 4 bytes of hash (todo: use full 32 bytes)
+	    printf("dataloader_init val_loader\n");
 	    dataloader_init(&val_loader, train_tokens, B, T, 0, 1, 1);
 	    manual_seed(&(val_loader.shuffle_rng),*hash2);
 	  
