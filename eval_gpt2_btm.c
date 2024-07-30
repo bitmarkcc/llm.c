@@ -1238,16 +1238,17 @@ int gpt2_eval(pfloat* ploss, uchar* block_hash, uchar* cp, size_t cp_bytes, int 
 	    // hash the active weights
 	    unsigned int hash [8]; // hash is 256 bit = 8*32 bit
 	    unsigned int hash2 [8];
-	    /*	    printf("Do SHA256 of:\n");
+	    printf("Do SHA256 of:\n");
 	    for (int i=0; i<32; i++) {
 		printf(" %02x",weight_state[i]);
 	    }
 	    printf("\n");
-	    for (int i=0; i<model.n_active_weights; i++) {
-		printf("%u ",*((uint32_t*)(weight_state+32+i*8)));
-		printf("%.8e\n",*((float*)(weight_state+32+i*8+4)));
+	    printf("%zu\n",*((size_t*)(weight_state+32)));
+	    for (int i=0; i<128; i++) {
+		printf("%u ",*((uint32_t*)(weight_state+40+i*8)));
+		printf("%.8e\n",*((float*)(weight_state+40+i*8+4)));
 	    }
-	    printf("\n");*/
+	    printf("...\n");
 	    SHA256(weight_state,weight_state_bytes,(uchar*)hash);
 	    printf("hash =");
 	    for (int i=0; i<4; i++)

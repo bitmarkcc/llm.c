@@ -1306,11 +1306,17 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
 		memcpy(weight_state+40+i*8,model.active_weights+i,4);
 		memcpy(weight_state+40+i*8+4,params_active[i],4);
 	    }
-	    /*printf("Do SHA256 of: \n");
-	    for (int i=0; i<weight_state_size; i++) {
-		printf("%u ",weight_state[i]);
+	    printf("Do SHA256 of: \n");
+	    for (int i=0; i<32; i++) {
+		printf(" %02x",weight_state[i]);
 	    }
-	    printf("\n");*/
+	    printf("\n");
+	    printf("%zu\n",*((size_t*)(weight_state+32)));
+	    for (int i=0; i<128; i++) {
+		printf("%u ",*((uint32_t*)(weight_state+40+i*8)));
+		printf("%.8e\n",*((float*)(weight_state+40+i*8+4)));
+	    }
+	    printf("...\n");
 	    SHA256(weight_state,weight_state_size,(uchar*)hash);
 	    SHA256((uchar*)hash,32,(uchar*)hash2);
 	    printf("hash2 = ");
@@ -1318,7 +1324,6 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
 		printf(" %u",((uchar*)hash2)[i]);
 	    printf("\n");
 	    // set seed to first 4 bytes of hash (todo: use full 32 bytes)
-	    printf("dataloader_init val_loader\n");
 	    manual_seed(&(val_loader.shuffle_rng),*hash2);
 	  
             float val_loss = 0.0f;
