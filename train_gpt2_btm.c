@@ -1323,6 +1323,7 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
 	    for (int i=0; i<4; i++)
 		printf(" %u",((uchar*)hash2)[i]);
 	    printf("\n");
+	    memcpy(weight_state,hash2,32); // use this hash for the next 'block hash'
 	    // set seed to first 4 bytes of hash (todo: use full 32 bytes)
 	    manual_seed(&(val_loader.shuffle_rng),*hash2);
 	  
@@ -1427,14 +1428,16 @@ int main(int argc, char** argv) {
     uchar* block_hash = 0;
     if (argc>1) {
 	int len = hex_to_uchar(&block_hash,argv[1]);
-	if (len != 32) {
-	    printf("block hash length must be 32 bytes (length 64 hex string)\n");
-	    exit(1);
+	if (len>0) {
+	    if (len != 32) {
+		printf("block hash length must be 32 bytes (length 64 hex string)\n");
+		exit(1);
+	    }
+	    printf("have block_hash =");
+	    for (int i=0; i<32; i++)
+		printf(" %02x",block_hash[i]);
+	    printf("\n");
 	}
-	printf("have block_hash =");
-	for (int i=0; i<32; i++)
-	    printf(" %02x",block_hash[i]);
-	printf("\n");
     }
     int depth = 12;
     if (argc>2)
@@ -1461,8 +1464,18 @@ int main(int argc, char** argv) {
 	int ret = fread(cp,1,cp_bytes,cpf);
 	fclose(cpf);
     }
-
-    int n_sweeps = 2; // this squared is the number of training calls
+    size_t bytes_scanned = 0; /* Get prev block hash from cp file */
+    while (bytes_scanned<cp_bytes) {
+	size_t n_cp_weights = *((size_t*)(cp+bytes_scanned+32));
+	if (bytes_scanned+40+n_cp_weights*8 == cp_bytes) {
+	    block_hash = malloc(32);
+	    memcpy(block_hash,cp+bytes_scanned,32);
+	    break;
+	}
+	bytes_scanned += 40+n_cp_weights*8;
+    }
+    
+    int n_sweeps = 8; // this squared is the number of training calls
     float loss = -1.0f;
     uchar* weight_state = 0;
     float best_loss = FLT_MAX;
