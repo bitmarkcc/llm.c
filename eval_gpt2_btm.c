@@ -1218,14 +1218,22 @@ int gpt2_eval(pfloat* ploss, uchar* block_hash, uchar* cp, size_t cp_bytes, int 
     uchar* weight_state = 0;
     size_t weight_state_bytes = 0;
     size_t bytes_scanned = 0;
+    size_t n_cp_weights_prev = 0;
     while (bytes_scanned < cp_bytes) {
 	size_t n_cp_weights = *((size_t*)(cp+bytes_scanned+32));
 	if (bytes_scanned+40+n_cp_weights*8 == cp_bytes) {
 	    weight_state_bytes = 40+n_cp_weights*8;
 	    weight_state = (uchar*)malloc(weight_state_bytes);
-	    memcpy(weight_state,cp+bytes_scanned,weight_state_bytes);
+	    if (n_cp_weights_prev>0) { /* use prev hash for evaluation */
+		memcpy(weight_state,cp+bytes_scanned-8*n_cp_weights_prev-40,32);
+	    }
+	    else {
+		memset(weight_state,255,32);
+	    }
+	    memcpy(weight_state+32,cp+bytes_scanned,weight_state_bytes-32);
 	}
 	bytes_scanned += 40+8*n_cp_weights;
+	n_cp_weights_prev = n_cp_weights;
     }
 
     struct timespec start, end;
@@ -1377,14 +1385,16 @@ int main(int argc, char** argv) {
     uchar* block_hash = 0;
     if (argc>1) {
 	int len = hex_to_uchar(&block_hash,argv[1]);
-	if (len != 32) {
-	    printf("block hash length must be 32 bytes (length 64 hex string)\n");
-	    exit(1);
+	if (len>0) {
+	    if (len != 32) {
+		printf("block hash length must be 32 bytes (length 64 hex string)\n");
+		exit(1);
+	    }
+	    printf("have block_hash =");
+	    for (int i=0; i<32; i++)
+		printf(" %02x",block_hash[i]);
+	    printf("\n");
 	}
-	printf("have block_hash =");
-	for (int i=0; i<32; i++)
-	    printf(" %02x",block_hash[i]);
-	printf("\n");
     }
     int depth = 12;
     if (argc>2)
