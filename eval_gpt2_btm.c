@@ -810,7 +810,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, int depth, uchar* cp, size_t cp_byt
 		uint32_t weight_index = ((uint32_t*)(cp+bytes_scanned+40))[2*i];
 		pfloat weight_value = ((float*)(cp+bytes_scanned+40))[2*i+1];
 		if (params_memory_cpu->at(weight_index) != 0.0f)
-		    printf("i=%d weight_index=%u, weight_value=%.8e\n",i,weight_index,weight_value.convert_to<float>());
+		    printf("i=%d weight_index=%u, weight_value=%.8e (replace %.8e)\n",i,weight_index,weight_value.convert_to<float>(),params_memory_cpu->at(weight_index).convert_to<float>());
 		params_memory_cpu->at(weight_index) = weight_value;
 	    }
 	    bytes_scanned += 40+n_cp_weights*8;

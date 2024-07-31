@@ -1475,7 +1475,7 @@ int main(int argc, char** argv) {
 	bytes_scanned += 40+n_cp_weights*8;
     }
     
-    int n_sweeps = 2; // this squared is the number of training calls
+    int n_sweeps = 8; // this squared is the number of training calls
     float loss = -1.0f;
     uchar* weight_state = 0;
     float best_loss = FLT_MAX;
