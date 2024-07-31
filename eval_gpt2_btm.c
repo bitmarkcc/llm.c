@@ -1230,7 +1230,7 @@ int gpt2_eval(pfloat* ploss, uchar* block_hash, uchar* cp, size_t cp_bytes, int 
 	    else {
 		memset(weight_state,255,32);
 	    }
-	    memcpy(weight_state+32,cp+bytes_scanned,weight_state_bytes-32);
+	    memcpy(weight_state+32,cp+bytes_scanned+32,weight_state_bytes-32);
 	}
 	bytes_scanned += 40+8*n_cp_weights;
 	n_cp_weights_prev = n_cp_weights;
