@@ -1258,10 +1258,10 @@ int gpt2_eval(pfloat* ploss, uchar* block_hash, uchar* cp, size_t cp_bytes, int 
 	    }
 	    printf("...\n");
 	    SHA256(weight_state,weight_state_bytes,(uchar*)hash);
-	    printf("hash =");
+	    /*printf("hash =");
 	    for (int i=0; i<4; i++)
 		printf(" %u",((uchar*)hash)[i]);
-	    printf("\n");
+		printf("\n");*/
 	    SHA256((uchar*)hash,32,(uchar*)hash2);
 	    printf("hash2 =");
 	    for (int i=0; i<4; i++)
