@@ -803,7 +803,7 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
 	// get random number from 0 to n_weights-1, not chosen before
 	while (true) {
 	    uint32_t rand_weight = (uint32_t)(randfloat32(&init_rng_1)*n_weights);
-	    if (!in_uint_array(active_weights,n_active_weights,rand_weight)) {
+	    if (!params_memory_active[rand_weight]) { // bitmap check, same result as scanning active_weights but O(1)
 		active_weights[i] = rand_weight;
 		params_memory_active[rand_weight] = true;
 		if (i%10000==0) printf("active_weights[%lu] = %u\n",i,active_weights[i]);

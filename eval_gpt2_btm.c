@@ -1227,6 +1227,9 @@ int gpt2_eval(pfloat* ploss, uchar* block_hash, uchar* cp, size_t cp_bytes, int 
 	    if (n_cp_weights_prev>0) { /* use prev hash for evaluation */
 		memcpy(weight_state,cp+bytes_scanned-8*n_cp_weights_prev-40,32);
 	    }
+	    else if (block_hash) { /* first record: prev hash is the block hash given at training time */
+		memcpy(weight_state,block_hash,32);
+	    }
 	    else {
 		memset(weight_state,255,32);
 	    }

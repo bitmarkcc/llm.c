@@ -264,7 +264,7 @@ train_gpt2_btm: train_gpt2_btm.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) -lcrypto $(OUTPUT_FILE)
 
 eval_gpt2_btm: eval_gpt2_btm.c
-	$(CXX) $(CFLAGS) -DLLMC_PFLOAT $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) -lcrypto -lmpfr $(OUTPUT_FILE)
+	$(CXX) $(CFLAGS) -DLLMC_PFLOAT $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) -lmimalloc -lcrypto -lmpfr $(OUTPUT_FILE)
 
 test_gpt2: test_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)

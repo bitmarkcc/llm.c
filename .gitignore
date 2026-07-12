@@ -37,3 +37,7 @@ dev/cuda/global_norm
 
 # log files
 *.log
+
+# btm chain state
+btm-cp.bin
+*~
