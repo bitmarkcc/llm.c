@@ -134,6 +134,28 @@ into the weight_state. Then cleanup and an upstream merge (2024-08-02).
   miner committed to. The first record now uses the block hash passed on the
   command line (later records were already correct — their prev-hash comes
   from the preceding record in the file).
+- **wasm float verifier built and validated (2026-07-13).** `eval_gpt2_btm_f32.c` is a
+  plain-C float32 port of the verifier: the layer/model code is taken verbatim from
+  `train_gpt2_btm.c` (so its arithmetic is exactly the miner's `sqrtf/expf/tanhf` float
+  math), the verifier logic is a float port of `eval_gpt2_btm.c`, and SHA-256 is the new
+  self-contained `llmc/sha256.h` (no OpenSSL; verified against standard vectors). It
+  compiles both natively and to wasm32-wasip1 (`make eval_gpt2_btm_f32` /
+  `make eval_gpt2_btm_f32.wasm`; toolchain paths overridable via `WASI_CLANG`,
+  `WASI_SYSROOT`, `WASI_BUILTINS`). Determinism comes from the wasm spec's exact IEEE 754
+  semantics + every node running the identical module, not from the numeric type. Strict
+  `-O2` only, never `-Ofast`/`-ffast-math`. Chain-format fields are read with explicit
+  `uint64_t` widths because wasm32 `size_t` is 32-bit. The verifier also self-checks that
+  the recomputed hash equals the record head stored in the chain file.
+  Results on the machine-1 chain (record anchored to block hash `b127cb60...`):
+  native and wasm outputs are byte-identical except timing -- `hash2 = 140 118 65 195`
+  (same as miner and MPFR verifier), val loss `10.824298`, bits `412d3053`;
+  ~17-25 s native (gcc -O2, 1 thread), ~19-20 s wasm (wasmtime 46, Cranelift), vs ~5 min
+  for MPFR+mimalloc. Machine-2 cross-check pending: run the SAME `.wasm` (plus
+  `btm-cp.bin` and the token file) under wasmtime there and compare `val loss bits`.
+  Toolchain build steps are recorded in Claude's memory (wasi-toolchain-source-build):
+  clang/lld via portage with `LLVM_TARGETS="X86 WebAssembly"`, wasi-libc source-built at
+  tag wasi-sdk-32, compiler-rt builtins source-built from the portage llvm distfile,
+  wasmtime musl binary.
 - **MPFR verification is allocation-bound, not arithmetic-bound.** On musl
   (mallocng allocator), a 124M eval took ~50 min using only ~2.6 of 8 cores —
   the OpenMP threads were serialized on allocator locks by per-operation MPFR
@@ -151,9 +173,11 @@ into the weight_state. Then cleanup and an upstream merge (2024-08-02).
   validity. That logic belongs on the Bitmark side, defined against the
   canonical `pfloat` loss.
 - **Seed the val RNG with the full 32-byte hash**, not just 4 bytes.
-- **Wasm packaging.** The `pfloat` evaluator needs to compile to wasm so
-  `OP_PUSHCODE` can carry it; no wasm exists yet in either repo. Wasm would
-  also strengthen determinism (its integer ops are fully deterministic).
+- **Wasm packaging.** Largely resolved (see Updates 2026-07): the float32 verifier
+  compiles to wasm32-wasip1 and is bit-reproducible. Remaining: cross-machine
+  confirmation, deciding the module's exact on-chain form for `OP_PUSHCODE`
+  (wasip1 file I/O vs passing chain data in memory), and embedding a runtime
+  (e.g. wasmtime's C API) in the Bitmark node.
 - **Scaling.** MPFR evaluation of a 124M model is slow and memory-heavy
   (every `pfloat` is a heap allocation), and ~500 KB of weight data per block
   is a lot of chain space. Largely mitigated for speed by mimalloc (~5 min,

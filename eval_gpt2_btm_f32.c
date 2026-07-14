@@ -1,11 +1,22 @@
 /*
-This file trains the GPT-2 model.
-This version is the clean, minimal, reference. As such:
-- it runs on CPU.
-- it does not make the code too complex; it is readable.
-- it does not use any processor-specific instructions, intrinsics and such.
-- it _does_ use a few OpenMP pragmas because this is a large speedup at very low cost
-There will be other versions of this code that specialize it and make it fast.
+Plain-float chain verifier for the btm proof-of-useful-work prototype.
+
+Rebuilds the model committed to by btm-cp.bin, recomputes the last record's chained
+hash, re-derives the val batch it selected, and computes the loss -- all in ordinary
+IEEE float32. Determinism across nodes comes not from the numeric type (as in the
+MPFR-based eval_gpt2_btm.c) but from compiling this file to wasm32-wasi: the wasm
+spec pins exact IEEE 754 semantics, and every node runs the identical module, so the
+loss is bit-for-bit reproducible at near-native speed.
+
+The layer/model code (up to and including gpt2_free) is taken verbatim from
+train_gpt2_btm.c so the verifier's arithmetic is exactly the miner's float math
+(sqrtf/expf/tanhf etc.). The verifier logic appended at the end is a float port of
+eval_gpt2_btm.c. Chain-format fields are read with explicit widths (uint64_t), never
+size_t, because size_t is 32-bit on wasm32.
+
+Build notes: compiles natively (no OpenSSL needed -- SHA-256 is llmc/sha256.h) and
+to wasm32-wasip1. Use -O2, never -Ofast/-ffast-math: fast-math would let the
+optimizer reorder float ops and destroy the exact IEEE semantics this exists for.
 */
 
 #include <stdio.h>
@@ -18,9 +29,9 @@ There will be other versions of this code that specialize it and make it fast.
 #include <string.h>
 #include <unistd.h>
 #include <limits.h>
-#include <openssl/sha.h>
 #include <float.h>
-#include <iostream>
+// defines: sha256_hash (self-contained SHA-256; no OpenSSL, works on wasm32-wasi)
+#include "llmc/sha256.h"
 #ifdef OMP
 #include <omp.h>
 #endif
@@ -31,8 +42,6 @@ There will be other versions of this code that specialize it and make it fast.
 #include "llmc/tokenizer.h"
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
 #include "llmc/dataloader.h"
-// defines: pfloat
-#include "llmc/pfloat.h"
 
 typedef unsigned char uchar;
 
@@ -40,8 +49,8 @@ typedef unsigned char uchar;
 // all the individual layers' forward and backward passes
 // B = batch_size, T = sequence_length, C = channels, V = vocab_size
 
-void encoder_forward(pfloat* out,
-                   int* inp, pfloat* wte, pfloat* wpe,
+void encoder_forward(float* out,
+                   int* inp, float* wte, float* wpe,
                    int B, int T, int C) {
     // out is (B,T,C). At each position (b,t), a C-dimensional vector summarizing token & position
     // inp is (B,T) of integers, holding the token ids at each (b,t) position
@@ -50,32 +59,32 @@ void encoder_forward(pfloat* out,
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             // seek to the output position in out[b,t,:]
-            pfloat* out_bt = out + b * T * C + t * C;
+            float* out_bt = out + b * T * C + t * C;
             // get the index of the token at inp[b, t]
             int ix = inp[b * T + t];
             // seek to the position in wte corresponding to the token
-            pfloat* wte_ix = wte + ix * C;
+            float* wte_ix = wte + ix * C;
             // seek to the position in wpe corresponding to the position
-            pfloat* wpe_t = wpe + t * C;
+            float* wpe_t = wpe + t * C;
             // add the two vectors and store the result in out[b,t,:]
             for (int i = 0; i < C; i++) {
                 out_bt[i] = wte_ix[i] + wpe_t[i];
-	    }
+            }
         }
     }
 }
 
-void encoder_backward(pfloat* dwte, pfloat* dwpe,
-                      pfloat* dout, int* inp,
+void encoder_backward(float* dwte, float* dwpe,
+                      float* dout, int* inp,
                       int B, int T, int C) {
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            pfloat* dout_bt = dout + b * T * C + t * C;
+            float* dout_bt = dout + b * T * C + t * C;
             int ix = inp[b * T + t];
-            pfloat* dwte_ix = dwte + ix * C;
-            pfloat* dwpe_t = dwpe + t * C;
+            float* dwte_ix = dwte + ix * C;
+            float* dwpe_t = dwpe + t * C;
             for (int i = 0; i < C; i++) {
-                pfloat d = dout_bt[i];
+                float d = dout_bt[i];
                 dwte_ix[i] += d;
                 dwpe_t[i] += d;
             }
@@ -83,39 +92,39 @@ void encoder_backward(pfloat* dwte, pfloat* dwpe,
     }
 }
 
-void layernorm_forward(pfloat* out, pfloat* mean, pfloat* rstd,
-                       pfloat* inp, pfloat* weight, pfloat* bias,
+void layernorm_forward(float* out, float* mean, float* rstd,
+                       float* inp, float* weight, float* bias,
                        int B, int T, int C) {
     // reference: https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html
     // both inp and out are (B,T,C) of the activations
     // mean and rstd are (B,T) buffers, to be used later in backward pass
     // at each position (b,t) of the input, the C-dimensional vector
     // of activations gets normalized, then scaled and shifted
-    pfloat eps = 1e-5f;
+    float eps = 1e-5f;
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             // seek to the input position inp[b,t,:]
-            pfloat* x = inp + b * T * C + t * C;
+            float* x = inp + b * T * C + t * C;
             // calculate the mean
-            pfloat m = 0.0f;
+            float m = 0.0f;
             for (int i = 0; i < C; i++) {
                 m += x[i];
             }
             m = m/C;
             // calculate the variance (without any bias correction)
-            pfloat v = 0.0f;
+            float v = 0.0f;
             for (int i = 0; i < C; i++) {
-                pfloat xshift = x[i] - m;
+                float xshift = x[i] - m;
                 v += xshift * xshift;
             }
             v = v/C;
             // calculate the rstd (reciprocal standard deviation)
-            pfloat s = 1.0f / sqrt(v + eps);
+            float s = 1.0f / sqrtf(v + eps);
             // seek to the output position in out[b,t,:]
-            pfloat* out_bt = out + b * T * C + t * C;
+            float* out_bt = out + b * T * C + t * C;
             for (int i = 0; i < C; i++) {
-                pfloat n = (s * (x[i] - m)); // normalize
-                pfloat o = n * weight[i] + bias[i]; // scale and shift
+                float n = (s * (x[i] - m)); // normalize
+                float o = n * weight[i] + bias[i]; // scale and shift
                 out_bt[i] = o; // write
             }
             // cache the mean and rstd for the backward pass later
@@ -125,23 +134,23 @@ void layernorm_forward(pfloat* out, pfloat* mean, pfloat* rstd,
     }
 }
 
-void layernorm_backward(pfloat* dinp, pfloat* dweight, pfloat* dbias,
-                        pfloat* dout, pfloat* inp, pfloat* weight, pfloat* mean, pfloat* rstd,
+void layernorm_backward(float* dinp, float* dweight, float* dbias,
+                        float* dout, float* inp, float* weight, float* mean, float* rstd,
                         int B, int T, int C) {
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            pfloat* dout_bt = dout + b * T * C + t * C;
-            pfloat* inp_bt = inp + b * T * C + t * C;
-            pfloat* dinp_bt = dinp + b * T * C + t * C;
-            pfloat mean_bt = mean[b * T + t];
-            pfloat rstd_bt = rstd[b * T + t];
+            float* dout_bt = dout + b * T * C + t * C;
+            float* inp_bt = inp + b * T * C + t * C;
+            float* dinp_bt = dinp + b * T * C + t * C;
+            float mean_bt = mean[b * T + t];
+            float rstd_bt = rstd[b * T + t];
 
             // first: two reduce operations
-            pfloat dnorm_mean = 0.0f;
-            pfloat dnorm_norm_mean = 0.0f;
+            float dnorm_mean = 0.0f;
+            float dnorm_norm_mean = 0.0f;
             for (int i = 0; i < C; i++) {
-                pfloat norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
-                pfloat dnorm_i = weight[i] * dout_bt[i];
+                float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
+                float dnorm_i = weight[i] * dout_bt[i];
                 dnorm_mean += dnorm_i;
                 dnorm_norm_mean += dnorm_i * norm_bti;
             }
@@ -150,14 +159,14 @@ void layernorm_backward(pfloat* dinp, pfloat* dweight, pfloat* dbias,
 
             // now iterate again and accumulate all the gradients
             for (int i = 0; i < C; i++) {
-                pfloat norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
-                pfloat dnorm_i = weight[i] * dout_bt[i];
+                float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
+                float dnorm_i = weight[i] * dout_bt[i];
                 // gradient contribution to bias
                 dbias[i] += dout_bt[i];
                 // gradient contribution to weight
                 dweight[i] += norm_bti * dout_bt[i];
                 // gradient contribution to input
-                pfloat dval = 0.0f;
+                float dval = 0.0f;
                 dval += dnorm_i; // term 1
                 dval -= dnorm_mean; // term 2
                 dval -= norm_bti * dnorm_norm_mean; // term 3
@@ -168,8 +177,8 @@ void layernorm_backward(pfloat* dinp, pfloat* dweight, pfloat* dbias,
     }
 }
 
-void matmul_forward_naive(pfloat* out,
-                         const pfloat* inp, const pfloat* weight, const pfloat* bias,
+void matmul_forward_naive(float* out,
+                         const float* inp, const float* weight, const float* bias,
                          int B, int T, int C, int OC) {
     // the most naive implementation of matrix multiplication
     // this serves as an algorithmic reference, and as a fallback for
@@ -179,7 +188,7 @@ void matmul_forward_naive(pfloat* out,
         for (int t = 0; t < T; t++) {
             int bt = b * T + t;
             for (int o = 0; o < OC; o++) {
-                pfloat val = (bias != NULL) ? bias[o] : 0.0f;
+                float val = (bias != NULL) ? bias[o] : 0.0f;
                 for (int i = 0; i < C; i++) {
                     val += inp[bt * C + i] * weight[o*C + i];
                 }
@@ -189,8 +198,8 @@ void matmul_forward_naive(pfloat* out,
     }
 }
 
-void matmul_forward(pfloat* out,
-                    const pfloat* inp, const pfloat* weight, const pfloat* bias,
+void matmul_forward(float* out,
+                    const float* inp, const float* weight, const float* bias,
                     int B, int T, int C, int OC) {
     // most of the running time is spent here and in matmul_backward
     // therefore, the implementation below is very mildly optimized
@@ -212,7 +221,7 @@ void matmul_forward(pfloat* out,
     for (int obt = 0; obt < B * T; obt += LOOP_UNROLL) {
         for (int o = 0; o < OC; o++) {
             // we'll keep LOOP_UNROLL many results in registers
-            pfloat result[LOOP_UNROLL];
+            float result[LOOP_UNROLL];
             // initialize the bias, if it exists
             for (int ibt = 0; ibt < LOOP_UNROLL; ibt++) {
                 result[ibt] = (bias != NULL) ? bias[o] : 0.0f;
@@ -221,7 +230,7 @@ void matmul_forward(pfloat* out,
             // the value of weight[i + o * C] and reuse it.
             // we compile with -Ofast, so the compiler will turn the inner loop into FMAs
             for (int i = 0; i < C; i++) {
-                pfloat w = weight[i + o * C];
+                float w = weight[i + o * C];
                 for (int ibt = 0; ibt < LOOP_UNROLL; ibt++) {
                     int bt = obt + ibt;
                     result[ibt] += inp[bt * C + i] * w;
@@ -236,8 +245,8 @@ void matmul_forward(pfloat* out,
     }
 }
 
-void matmul_backward(pfloat* dinp, pfloat* dweight, pfloat* dbias,
-                     const pfloat* dout, const pfloat* inp, const pfloat* weight,
+void matmul_backward(float* dinp, float* dweight, float* dbias,
+                     const float* dout, const float* inp, const float* weight,
                      int B, int T, int C, int OC) {
     // most of the running time is spent here and in matmul_forward
     // this backward could be done in a single "round" of loops
@@ -247,11 +256,11 @@ void matmul_backward(pfloat* dinp, pfloat* dweight, pfloat* dbias,
     #pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            const pfloat* dout_bt = dout + b * T * OC + t * OC;
-            pfloat* dinp_bt = dinp + b * T * C + t * C;
+            const float* dout_bt = dout + b * T * OC + t * OC;
+            float* dinp_bt = dinp + b * T * C + t * C;
             for (int o = 0; o < OC; o++) {
-                const pfloat* wrow = weight + o*C;
-                pfloat d = dout_bt[o];
+                const float* wrow = weight + o*C;
+                float d = dout_bt[o];
                 for (int i = 0; i < C; i++) {
                     dinp_bt[i] += wrow[i] * d;
                 }
@@ -263,10 +272,10 @@ void matmul_backward(pfloat* dinp, pfloat* dweight, pfloat* dbias,
     for (int o = 0; o < OC; o++) {
         for (int b = 0; b < B; b++) {
             for (int t = 0; t < T; t++) {
-                const pfloat* dout_bt = dout + b * T * OC + t * OC;
-                const pfloat* inp_bt = inp + b * T * C + t * C;
-                pfloat* dwrow = dweight + o*C;
-                pfloat d = dout_bt[o];
+                const float* dout_bt = dout + b * T * OC + t * OC;
+                const float* inp_bt = inp + b * T * C + t * C;
+                float* dwrow = dweight + o*C;
+                float d = dout_bt[o];
                 if (dbias != NULL) { dbias[o] += d; }
                 for (int i = 0; i < C; i++) {
                     dwrow[i] += inp_bt[i] * d;
@@ -276,8 +285,8 @@ void matmul_backward(pfloat* dinp, pfloat* dweight, pfloat* dbias,
     }
 }
 
-void attention_forward(pfloat* out, pfloat* preatt, pfloat* att,
-                       pfloat* inp,
+void attention_forward(float* out, float* preatt, float* att,
+                       float* inp,
                        int B, int T, int C, int NH) {
     // input is (B, T, 3C) holding the query, key, value (Q, K, V) vectors
     // preatt, att are (B, NH, T, T). NH = number of heads, T = sequence length
@@ -288,23 +297,23 @@ void attention_forward(pfloat* out, pfloat* preatt, pfloat* att,
     // (and of course, no layer mixes information across batch)
     int C3 = C*3;
     int hs = C / NH; // head size
-    pfloat scale = 1.0 / sqrt(hs);
+    float scale = 1.0 / sqrtf(hs);
 
     #pragma omp parallel for collapse(3)
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             for (int h = 0; h < NH; h++) {
-                pfloat* query_t = inp + b * T * C3 + t * C3 + h * hs;
-                pfloat* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
-                pfloat* att_bth = att + b*NH*T*T + h*T*T + t*T;
+                float* query_t = inp + b * T * C3 + t * C3 + h * hs;
+                float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
+                float* att_bth = att + b*NH*T*T + h*T*T + t*T;
 
                 // pass 1: calculate query dot key and maxval
-                pfloat maxval = -10000.0f; // TODO something better
+                float maxval = -10000.0f; // TODO something better
                 for (int t2 = 0; t2 <= t; t2++) {
-                    pfloat* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+                    float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
 
                     // (query_t) dot (key_t2)
-                    pfloat val = 0.0f;
+                    float val = 0.0f;
                     for (int i = 0; i < hs; i++) {
                         val += query_t[i] * key_t2[i];
                     }
@@ -318,13 +327,13 @@ void attention_forward(pfloat* out, pfloat* preatt, pfloat* att,
 
                 // pass 2: calculate the exp and keep track of sum
                 // maxval is being calculated and subtracted only for numerical stability
-                pfloat expsum = 0.0f;
+                float expsum = 0.0f;
                 for (int t2 = 0; t2 <= t; t2++) {
-                    pfloat expv = exp(preatt_bth[t2] - maxval);
+                    float expv = expf(preatt_bth[t2] - maxval);
                     expsum += expv;
                     att_bth[t2] = expv;
                 }
-                pfloat expsum_inv = expsum == pfloat(0.0f) ? pfloat(0.0f) : 1.0f / expsum;
+                float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
 
                 // pass 3: normalize to get the softmax
                 for (int t2 = 0; t2 < T; t2++) {
@@ -338,11 +347,11 @@ void attention_forward(pfloat* out, pfloat* preatt, pfloat* att,
                 }
 
                 // pass 4: accumulate weighted values into the output of attention
-                pfloat* out_bth = out + b * T * C + t * C + h * hs;
+                float* out_bth = out + b * T * C + t * C + h * hs;
                 for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
                 for (int t2 = 0; t2 <= t; t2++) {
-                    pfloat* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
-                    pfloat att_btht2 = att_bth[t2];
+                    float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
+                    float att_btht2 = att_bth[t2];
                     for (int i = 0; i < hs; i++) {
                         out_bth[i] += att_btht2 * value_t2[i];
                     }
@@ -352,30 +361,30 @@ void attention_forward(pfloat* out, pfloat* preatt, pfloat* att,
     }
 }
 
-void attention_backward(pfloat* dinp, pfloat* dpreatt, pfloat* datt,
-                        pfloat* dout, pfloat* inp, pfloat* att,
+void attention_backward(float* dinp, float* dpreatt, float* datt,
+                        float* dout, float* inp, float* att,
                         int B, int T, int C, int NH) {
     // inp/dinp are (B, T, 3C) Q,K,V
     // att/datt/dpreatt are (B, NH, T, T)
     // dout is (B, T, C)
     int C3 = C*3;
     int hs = C / NH; // head size
-    pfloat scale = 1.0 / sqrt(hs);
+    float scale = 1.0 / sqrtf(hs);
 
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             for (int h = 0; h < NH; h++) {
-                pfloat* att_bth = att + b*NH*T*T + h*T*T + t*T;
-                pfloat* datt_bth = datt + b*NH*T*T + h*T*T + t*T;
-                pfloat* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
-                pfloat* dquery_t = dinp + b * T * C3 + t * C3 + h * hs;
-                pfloat* query_t = inp + b * T * C3 + t * C3 + h * hs;
+                float* att_bth = att + b*NH*T*T + h*T*T + t*T;
+                float* datt_bth = datt + b*NH*T*T + h*T*T + t*T;
+                float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
+                float* dquery_t = dinp + b * T * C3 + t * C3 + h * hs;
+                float* query_t = inp + b * T * C3 + t * C3 + h * hs;
 
                 // backward pass 4, through the value accumulation
-                pfloat* dout_bth = dout + b * T * C + t * C + h * hs;
+                float* dout_bth = dout + b * T * C + t * C + h * hs;
                 for (int t2 = 0; t2 <= t; t2++) {
-                    pfloat* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
-                    pfloat* dvalue_t2 = dinp + b * T * C3 + t2 * C3 + h * hs + C*2;
+                    float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
+                    float* dvalue_t2 = dinp + b * T * C3 + t2 * C3 + h * hs + C*2;
                     for (int i = 0; i < hs; i++) {
                         // in the forward pass this was:
                         // out_bth[i] += att_bth[t2] * value_t2[i];
@@ -389,16 +398,16 @@ void attention_backward(pfloat* dinp, pfloat* dpreatt, pfloat* datt,
                 // note that softmax (like e.g. tanh) doesn't need the input (preatt) to backward
                 for (int t2 = 0; t2 <= t; t2++) {
                     for (int t3 = 0; t3 <= t; t3++) {
-                        pfloat indicator = t2 == t3 ? 1.0f : 0.0f;
-                        pfloat local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
+                        float indicator = t2 == t3 ? 1.0f : 0.0f;
+                        float local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
                         dpreatt_bth[t3] += local_derivative * datt_bth[t2];
                     }
                 }
 
                 // backward pass 1, the query @ key matmul
                 for (int t2 = 0; t2 <= t; t2++) {
-                    pfloat* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
-                    pfloat* dkey_t2 = dinp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+                    float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+                    float* dkey_t2 = dinp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
                     for (int i = 0; i < hs; i++) {
                         // in the forward pass this was:
                         // preatt_bth[t2] += (query_t[i] * key_t2[i]) * scale;
@@ -412,49 +421,49 @@ void attention_backward(pfloat* dinp, pfloat* dpreatt, pfloat* datt,
     }
 }
 
-#define GELU_SCALING_FACTOR sqrt(2.0f / M_PI)
-void gelu_forward(pfloat* out, pfloat* inp, int N) {
+#define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
+void gelu_forward(float* out, float* inp, int N) {
     // (approximate) GeLU elementwise non-linearity in the MLP block of Transformer
     for (int i = 0; i < N; i++) {
-        pfloat x = inp[i];
-        pfloat cube = 0.044715f * x * x * x;
-        out[i] = 0.5f * x * (1.0f + tanh(GELU_SCALING_FACTOR * (x + cube)));
+        float x = inp[i];
+        float cube = 0.044715f * x * x * x;
+        out[i] = 0.5f * x * (1.0f + tanhf(GELU_SCALING_FACTOR * (x + cube)));
     }
 }
 
 // we want to use -Ofast optimization, but sadly GeLU breaks, so disable this flag just for it (#168)
-#pragma pfloat_control(precise, on, push)
+#pragma float_control(precise, on, push)
 #if defined(__GNUC__) && !defined(__clang__)
 __attribute__((optimize("no-finite-math-only")))
 #endif
-void gelu_backward(pfloat* dinp, pfloat* inp, pfloat* dout, int N) {
+void gelu_backward(float* dinp, float* inp, float* dout, int N) {
     for (int i = 0; i < N; i++) {
-        pfloat x = inp[i];
-        pfloat cube = 0.044715f * x * x * x;
-        pfloat tanh_arg = GELU_SCALING_FACTOR * (x + cube);
-        pfloat tanh_out = tanh(tanh_arg);
-        pfloat coshf_out = cosh(tanh_arg);
-        pfloat sech_out = 1.0f / (coshf_out * coshf_out);
-        pfloat local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x);
+        float x = inp[i];
+        float cube = 0.044715f * x * x * x;
+        float tanh_arg = GELU_SCALING_FACTOR * (x + cube);
+        float tanh_out = tanhf(tanh_arg);
+        float coshf_out = coshf(tanh_arg);
+        float sech_out = 1.0f / (coshf_out * coshf_out);
+        float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x);
         dinp[i] += local_grad * dout[i];
     }
 }
-#pragma pfloat_control(pop)
+#pragma float_control(pop)
 
-void residual_forward(pfloat* out, pfloat* inp1, pfloat* inp2, int N) {
+void residual_forward(float* out, float* inp1, float* inp2, int N) {
     for (int i = 0; i < N; i++) {
         out[i] = inp1[i] + inp2[i];
     }
 }
 
-void residual_backward(pfloat* dinp1, pfloat* dinp2, pfloat* dout, int N) {
+void residual_backward(float* dinp1, float* dinp2, float* dout, int N) {
     for (int i = 0; i < N; i++) {
         dinp1[i] += dout[i];
         dinp2[i] += dout[i];
     }
 }
 
-void softmax_forward(pfloat* probs, pfloat* logits, int B, int T, int V, int Vp) {
+void softmax_forward(float* probs, float* logits, int B, int T, int V, int Vp) {
     // output: probs are (B,T,Vp) of the probabilities (sums to 1.0 in each b,t position)
     // input: logits is (B,T,Vp) of the unnormalized log probabilities
     // Vp is the padded vocab size (for efficiency), V is the "real" vocab size
@@ -463,19 +472,19 @@ void softmax_forward(pfloat* probs, pfloat* logits, int B, int T, int V, int Vp)
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             // probs <- softmax(logits)
-            pfloat* logits_bt = logits + b * T * Vp + t * Vp;
-            pfloat* probs_bt = probs + b * T * Vp + t * Vp;
+            float* logits_bt = logits + b * T * Vp + t * Vp;
+            float* probs_bt = probs + b * T * Vp + t * Vp;
 
             // maxval is only calculated and subtracted for numerical stability
-            pfloat maxval = -10000.0f; // TODO something better
+            float maxval = -10000.0f; // TODO something better
             for (int i = 0; i < V; i++) {
                 if (logits_bt[i] > maxval) {
                     maxval = logits_bt[i];
                 }
             }
-            pfloat sum = 0.0f;
+            float sum = 0.0f;
             for (int i = 0; i < V; i++) {
-                probs_bt[i] = exp(logits_bt[i] - maxval);
+                probs_bt[i] = expf(logits_bt[i] - maxval);
                 sum += probs_bt[i];
             }
             // note we only loop to V, leaving the padded dimensions
@@ -491,8 +500,8 @@ void softmax_forward(pfloat* probs, pfloat* logits, int B, int T, int V, int Vp)
     }
 }
 
-void crossentropy_forward(pfloat* losses,
-                          pfloat* probs, int* targets,
+void crossentropy_forward(float* losses,
+                          float* probs, int* targets,
                           int B, int T, int Vp) {
     // output: losses is (B,T) of the individual losses at each position
     // input: probs are (B,T,Vp) of the probabilities
@@ -500,28 +509,28 @@ void crossentropy_forward(pfloat* losses,
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             // loss = -log(probs[target])
-            pfloat* probs_bt = probs + b * T * Vp + t * Vp;
+            float* probs_bt = probs + b * T * Vp + t * Vp;
             int ix = targets[b * T + t];
-            losses[b * T + t] = -log(probs_bt[ix]);
+            losses[b * T + t] = -logf(probs_bt[ix]);
         }
     }
 }
 
-void crossentropy_softmax_backward(pfloat* dlogits,
-                           pfloat* dlosses, pfloat* probs, int* targets,
+void crossentropy_softmax_backward(float* dlogits,
+                           float* dlosses, float* probs, int* targets,
                            int B, int T, int V, int Vp) {
     // backwards through both softmax and crossentropy
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            pfloat* dlogits_bt = dlogits + b * T * Vp + t * Vp;
-            pfloat* probs_bt = probs + b * T * Vp + t * Vp;
-            pfloat dloss = dlosses[b * T + t];
+            float* dlogits_bt = dlogits + b * T * Vp + t * Vp;
+            float* probs_bt = probs + b * T * Vp + t * Vp;
+            float dloss = dlosses[b * T + t];
             int ix = targets[b * T + t];
             // note we only loop to V, leaving the padded dimensions
             // of dlogits untouched, so gradient there stays at zero
             for (int i = 0; i < V; i++) {
-                pfloat p = probs_bt[i];
-                pfloat indicator = i == ix ? 1.0f : 0.0f;
+                float p = probs_bt[i];
+                float indicator = i == ix ? 1.0f : 0.0f;
                 dlogits_bt[i] += (p - indicator) * dloss;
             }
         }
@@ -543,22 +552,22 @@ typedef struct {
 // the parameters of the model
 #define NUM_PARAMETER_TENSORS 16
 typedef struct {
-    pfloat* wte; // (V, C)
-    pfloat* wpe; // (maxT, C)
-    pfloat* ln1w; // (L, C)
-    pfloat* ln1b; // (L, C)
-    pfloat* qkvw; // (L, 3*C, C)
-    pfloat* qkvb; // (L, 3*C)
-    pfloat* attprojw; // (L, C, C)
-    pfloat* attprojb; // (L, C)
-    pfloat* ln2w; // (L, C)
-    pfloat* ln2b; // (L, C)
-    pfloat* fcw; // (L, 4*C, C)
-    pfloat* fcb; // (L, 4*C)
-    pfloat* fcprojw; // (L, C, 4*C)
-    pfloat* fcprojb; // (L, C)
-    pfloat* lnfw; // (C)
-    pfloat* lnfb; // (C)
+    float* wte; // (V, C)
+    float* wpe; // (maxT, C)
+    float* ln1w; // (L, C)
+    float* ln1b; // (L, C)
+    float* qkvw; // (L, 3*C, C)
+    float* qkvb; // (L, 3*C)
+    float* attprojw; // (L, C, C)
+    float* attprojb; // (L, C)
+    float* ln2w; // (L, C)
+    float* ln2b; // (L, C)
+    float* fcw; // (L, 4*C, C)
+    float* fcb; // (L, 4*C)
+    float* fcprojw; // (L, C, 4*C)
+    float* fcprojb; // (L, C)
+    float* lnfw; // (C)
+    float* lnfb; // (C)
 } ParameterTensors;
 
 void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
@@ -585,21 +594,20 @@ void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
-std::vector<pfloat>* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes) {
+float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes) {
     size_t num_parameters = 0;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         num_parameters += param_sizes[i];
     }
     // malloc all parameters all at once
-    //pfloat* params_memory = (pfloat*)mallocCheck(num_parameters * sizeof(pfloat));
-    std::vector<pfloat>* params_memory = new std::vector<pfloat>(num_parameters);
+    float* params_memory = (float*)mallocCheck(num_parameters * sizeof(float));
     // assign all the tensors
-    pfloat** ptrs[] = {
+    float** ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
         &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
         &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
     };
-    pfloat* params_memory_iterator = params_memory->data();
+    float* params_memory_iterator = params_memory;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         *(ptrs[i]) = params_memory_iterator;
         params_memory_iterator += param_sizes[i];
@@ -609,44 +617,44 @@ std::vector<pfloat>* malloc_and_point_parameters(ParameterTensors* params, size_
 
 #define NUM_ACTIVATION_TENSORS 23
 typedef struct {
-    pfloat* encoded; // (B, T, C)
-    pfloat* ln1; // (L, B, T, C)
-    pfloat* ln1_mean; // (L, B, T)
-    pfloat* ln1_rstd; // (L, B, T)
-    pfloat* qkv; // (L, B, T, 3*C)
-    pfloat* atty; // (L, B, T, C)
-    pfloat* preatt; // (L, B, NH, T, T)
-    pfloat* att; // (L, B, NH, T, T)
-    pfloat* attproj; // (L, B, T, C)
-    pfloat* residual2; // (L, B, T, C)
-    pfloat* ln2; // (L, B, T, C)
-    pfloat* ln2_mean; // (L, B, T)
-    pfloat* ln2_rstd; // (L, B, T)
-    pfloat* fch; // (L, B, T, 4*C)
-    pfloat* fch_gelu; // (L, B, T, 4*C)
-    pfloat* fcproj; // (L, B, T, C)
-    pfloat* residual3; // (L, B, T, C)
-    pfloat* lnf; // (B, T, C)
-    pfloat* lnf_mean; // (B, T)
-    pfloat* lnf_rstd; // (B, T)
-    pfloat* logits; // (B, T, V)
-    pfloat* probs; // (B, T, V)
-    pfloat* losses; // (B, T)
+    float* encoded; // (B, T, C)
+    float* ln1; // (L, B, T, C)
+    float* ln1_mean; // (L, B, T)
+    float* ln1_rstd; // (L, B, T)
+    float* qkv; // (L, B, T, 3*C)
+    float* atty; // (L, B, T, C)
+    float* preatt; // (L, B, NH, T, T)
+    float* att; // (L, B, NH, T, T)
+    float* attproj; // (L, B, T, C)
+    float* residual2; // (L, B, T, C)
+    float* ln2; // (L, B, T, C)
+    float* ln2_mean; // (L, B, T)
+    float* ln2_rstd; // (L, B, T)
+    float* fch; // (L, B, T, 4*C)
+    float* fch_gelu; // (L, B, T, 4*C)
+    float* fcproj; // (L, B, T, C)
+    float* residual3; // (L, B, T, C)
+    float* lnf; // (B, T, C)
+    float* lnf_mean; // (B, T)
+    float* lnf_rstd; // (B, T)
+    float* logits; // (B, T, V)
+    float* probs; // (B, T, V)
+    float* losses; // (B, T)
 } ActivationTensors;
 
-std::vector<pfloat>* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) {
+float* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) {
     size_t num_activations = 0;
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
         num_activations += act_sizes[i];
     }
-    std::vector<pfloat>* acts_memory = new std::vector<pfloat>(num_activations);
-    pfloat** ptrs[] = {
+    float* acts_memory = (float*)mallocCheck(num_activations * sizeof(float));
+    float** ptrs[] = {
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->qkv, &acts->atty,
         &acts->preatt, &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
         &acts->ln2_rstd, &acts->fch, &acts->fch_gelu, &acts->fcproj, &acts->residual3, &acts->lnf,
         &acts->lnf_mean, &acts->lnf_rstd, &acts->logits, &acts->probs, &acts->losses
     };
-    pfloat* acts_memory_iterator = acts_memory->data();
+    float* acts_memory_iterator = acts_memory;
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
         *(ptrs[i]) = acts_memory_iterator;
         acts_memory_iterator += act_sizes[i];
@@ -659,40 +667,101 @@ typedef struct {
     // the weights (parameters) of the model, and their sizes
     ParameterTensors params;
     size_t param_sizes[NUM_PARAMETER_TENSORS];
-    std::vector<pfloat>* params_memory;
+    float* params_memory;
     size_t num_parameters;
     // gradients of the weights
     ParameterTensors grads;
-    std::vector<pfloat>* grads_memory;
+    float* grads_memory;
     // buffers for the AdamW optimizer
-    std::vector<pfloat>* m_memory;
-    std::vector<pfloat>* v_memory;
+    float* m_memory;
+    float* v_memory;
     // the activations of the model, and their sizes
     ActivationTensors acts;
     size_t act_sizes[NUM_ACTIVATION_TENSORS];
-    std::vector<pfloat>* acts_memory;
+    float* acts_memory;
     size_t num_activations;
     // gradients of the activations
     ActivationTensors grads_acts;
-    std::vector<pfloat>* grads_acts_memory;
+    float* grads_acts_memory;
     // other run state configuration
     int batch_size; // the batch size (B) of current forward pass
     int seq_len; // the sequence length (T) of current forward pass
     int* inputs; // the input tokens for the current forward pass
     int* targets; // the target tokens for the current forward pass
-    pfloat mean_loss; // after a forward pass with targets, will be populated with the mean loss
+    float mean_loss; // after a forward pass with targets, will be populated with the mean loss
     // the currently active weights/parameters
     uint32_t* active_weights;
     size_t n_active_weights;
     bool* params_memory_active;
 } GPT2;
 
-// Rebuild the exact model that the chain (cp = contents of btm-cp.bin) commits to.
-// Unlike training, no RNG is needed: every weight that was ever trained is stored with
-// its exact float bit pattern in some chain record, and all remaining weights are
-// deterministic constants (layernorm params 1.0, everything else 0.0). So the model is
-// reconstructed as: all zeros -> layernorm params = 1 -> apply every record in order.
-void gpt2_build_from_checkpoint(GPT2 *model, int depth, uchar* cp, size_t cp_bytes) {
+void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
+
+    // read in model from a checkpoint file
+    FILE *model_file = fopenCheck(checkpoint_path, "rb");
+    if (model_file == NULL) { printf("Error opening model file\n"); exit(1); }
+    int model_header[256];
+    freadCheck(model_header, sizeof(int), 256, model_file);
+    if (model_header[0] != 20240326) { printf("Bad magic model file\n"); exit(1); }
+    if (model_header[1] != 3) {
+        printf("Bad version in model file\n");
+        printf("---> HINT: try to re-run `python train_gpt2.py`\n");
+        exit(1);
+    }
+
+    // read in hyperparameters
+    size_t maxT, V, Vp, L, NH, C; // size_t to prevent int overflow
+    model->config.max_seq_len = maxT = model_header[2];
+    model->config.vocab_size = V = model_header[3];
+    model->config.num_layers = L = model_header[4];
+    model->config.num_heads = NH = model_header[5];
+    model->config.channels = C = model_header[6];
+    model->config.padded_vocab_size = Vp = model_header[7];
+    printf("[GPT-2]\n");
+    printf("max_seq_len: %zu\n", maxT);
+    printf("vocab_size: %zu\n", V);
+    printf("padded_vocab_size: %zu\n", Vp);
+    printf("num_layers: %zu\n", L);
+    printf("num_heads: %zu\n", NH);
+    printf("channels: %zu\n", C);
+
+    // allocate space for all the parameters and read them in
+    fill_in_parameter_sizes(model->param_sizes,  model->config);
+
+    // count the number of parameters
+    size_t num_parameters = 0;
+    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        num_parameters += model->param_sizes[i];
+    }
+    printf("num_parameters: %zu\n", num_parameters);
+    model->num_parameters = num_parameters;
+
+    // read in all the parameters from file
+    model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes);
+    freadCheck(model->params_memory, sizeof(float), num_parameters, model_file);
+    fcloseCheck(model_file);
+
+    // other inits
+    model->acts_memory = NULL;
+    model->grads_memory = NULL;
+    model->m_memory = NULL;
+    model->v_memory = NULL;
+    model->grads_acts_memory = NULL;
+    model->inputs = NULL;
+    model->targets = NULL;
+    model->batch_size = 0;
+    model->seq_len = 0;
+    model->mean_loss = -1.0f; // -1.0f will designate no loss
+}
+
+// Build the miner's starting model. Two independent seeds with distinct roles:
+//   rng_seed_1 picks WHICH n_active_weights parameter indices this attempt will train;
+//   rng_seed_2 draws their random initial values (GPT-2 style normal init).
+// All other weights start at 0 (layernorm params at 1), then the chain records in cp are
+// applied on top -- each attempt trains on top of the network accumulated so far.
+// The seeds are the miner's free choice and are NOT consensus-relevant: the published
+// record stores explicit (index,value) pairs, so verifiers never replay this init.
+void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, unsigned int rng_seed_1, unsigned int rng_seed_2, uchar* cp, size_t cp_bytes) {
     // init random (training from scratch)
 
     // parameterize the size of gpt2 based only on the depth of the model (num_layers)
@@ -717,7 +786,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, int depth, uchar* cp, size_t cp_byt
     size_t num_parameters_bytes = 0;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         model->num_parameters += model->param_sizes[i];
-        num_parameters_bytes += model->param_sizes[i] * sizeof(pfloat);
+        num_parameters_bytes += model->param_sizes[i] * sizeof(float);
     }
     // create memory for model parameters on the device
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes);
@@ -732,26 +801,49 @@ void gpt2_build_from_checkpoint(GPT2 *model, int depth, uchar* cp, size_t cp_byt
     model->batch_size = 0;
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f will designate no loss
-    
-    model->active_weights = NULL;
-    model->n_active_weights = 0;
-    model->params_memory_active = NULL;
 
-    //mt19937_state init_rng_2;
-    //manual_seed(&init_rng_2, rng_seed_2);
+    //size_t n_active_weights = 4000; // number of weights that will be adjusted (change to 4000)
+    printf("n_active_weights = %lu\n",n_active_weights);
+    mt19937_state init_rng_1;
+    manual_seed(&init_rng_1, rng_seed_1);
+
+    // get a random subset of weights
+    uint32_t* active_weights = malloc(n_active_weights*sizeof(uint32_t));
+    size_t n_weights = model->num_parameters;
+    printf("n_weights = %lu\n",n_weights);
+    for (size_t i=0; i<n_active_weights; i++)
+	active_weights[i] = n_weights; // dummy value
+    bool* params_memory_active = malloc(sizeof(bool)*n_weights);
+    for (size_t i=0; i<n_weights; i++)
+	params_memory_active[i] = false;
+    int i_active = 0;
+    printf("rng_seed_1 = %u\n",rng_seed_1);
+    for (size_t i=0; i<n_active_weights; i++) {
+	// get random number from 0 to n_weights-1, not chosen before
+	while (true) {
+	    uint32_t rand_weight = (uint32_t)(randfloat32(&init_rng_1)*n_weights);
+	    if (!params_memory_active[rand_weight]) { // bitmap check, same result as scanning active_weights but O(1)
+		active_weights[i] = rand_weight;
+		params_memory_active[rand_weight] = true;
+		if (i%10000==0) printf("active_weights[%lu] = %u\n",i,active_weights[i]);
+		break;
+	    }
+	}
+    }
+    
+    model->active_weights = active_weights;
+    model->n_active_weights = n_active_weights;
+    model->params_memory_active = params_memory_active;
+
+    mt19937_state init_rng_2;
+    manual_seed(&init_rng_2, rng_seed_2);
     // allocate and random init the memory for all the parameters with GPT-2 schema
     // weights ~N(0, 0.02), biases 0, c_proj weights ~N(0, 0.02/(2*L)**0.5)
-    // NOTE: assuming all parameters are of the type pfloatX, could be relaxed later
-    //pfloat* params_memory_cpu = (pfloat*)mallocCheck(num_parameters_bytes);
-    std::vector<pfloat>* params_memory_cpu = model->params_memory;
-    //memset(params_memory_cpu, 0, num_parameters_bytes);
-    /*for (size_t i=0; i<n_weights; i++) {
-	if (i%1000000==0)
-	    printf("set params_memory_cpu[%lu] = 0\n",i);
-	params_memory_cpu[i] = pfloat(0);
-	}*/
+    // NOTE: assuming all parameters are of the type floatX, could be relaxed later
+    float* params_memory_cpu = (float*)mallocCheck(num_parameters_bytes);
+    memset(params_memory_cpu, 0, num_parameters_bytes);
     // fill in all the weights with random values
-    pfloat residual_scale = 1.0f / sqrt(2.0f * model->config.num_layers);
+    float residual_scale = 1.0f / sqrtf(2.0f * model->config.num_layers);
     // we have to init all these tensors exactly in the order that PyTorch initializes them
     // so that we can match them up and get correctness and exactly the same initial conditions
     size_t L = model->config.num_layers;
@@ -762,7 +854,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, int depth, uchar* cp, size_t cp_byt
             // the layernorm parameters are all initialized to 1
             if (l == 0 && (i == 2 || i == 8 || i == 14)) { // only at l = 0 to init these just once
                 for (size_t j = 0; j < model->param_sizes[i]; j++) {
-                    params_memory_cpu->at(offset + j) = 1.0f;
+                    params_memory_cpu[offset + j] = 1.0f;
                 }
             }
             // weights tensors are handled here
@@ -782,51 +874,45 @@ void gpt2_build_from_checkpoint(GPT2 *model, int depth, uchar* cp, size_t cp_byt
                 }
                 // in GPT-2, the projections back into the residual stream are additionally
                 // scaled by 1/sqrt(2*L) for training stability
-                pfloat scale = (i == 6 || i == 12) ? 0.02f * residual_scale : pfloat(0.02f);
+                float scale = (i == 6 || i == 12) ? 0.02f * residual_scale : 0.02f;
                 // okay let's draw the random numbers and write them
-                //pfloat *fp32_buffer = (pfloat*)mallocCheck(n * sizeof(pfloat));
-		/*std::vector<pfloat> vpfBuffer (n);
-		  pnormal_(vpfBuffer.data(), n, 0.0f, scale, &init_rng_2, params_memory_active+offset+layer_offset);
+                float *fp32_buffer = (float*)mallocCheck(n * sizeof(float));
+                normal_(fp32_buffer, n, 0.0f, scale, &init_rng_2);
                 for (size_t j = 0; j < n; j++) {
-		size_t i_pmc = offset+layer_offset+j;*/
-		    /*if (params_memory_active[i_pmc]) {
-			params_memory_cpu->at(i_pmc) = vpfBuffer[j];
-			}*/
+		    size_t i_pmc = offset+layer_offset+j;
+		    if (params_memory_active[i_pmc]) {
+			params_memory_cpu[i_pmc] = fp32_buffer[j];
+		    }
 		    /*else { // set inactive weights to 0
 			params_memory_cpu[i_pmc] = 0.0f;
 			}*/
-                /*}
-		  vpfBuffer.clear();*/
-                //free(fp32_buffer);
+                }
+                free(fp32_buffer);
             }
             offset += model->param_sizes[i];
         }
     }
 
-    // apply checkpoint data: walk the chain file record by record and write each record's
-    // (index,value) pairs into the parameter buffer. Records are applied oldest-first, so
-    // if a later record retrained a weight index, the newer value wins.
-    // Record layout: <32B hash><8B count N><N x (uint32 index, float32 value)> = 40+8N bytes.
+    // apply checkpoint data
     if (cp_bytes % 8 != 0) {
 	printf("Warning: The size of the checkpoint data is not a multiple of 8. Ignoring it.\n");
     }
     else {
 	size_t bytes_scanned = 0;
 	while (bytes_scanned<cp_bytes) {
-	    size_t n_cp_weights = *((size_t*)(cp+bytes_scanned+32)); // count field N of this record
+	    size_t n_cp_weights = *((size_t*)(cp+bytes_scanned+32));
 	    for (int i=0; i<n_cp_weights; i++) {
 		uint32_t weight_index = ((uint32_t*)(cp+bytes_scanned+40))[2*i];
-		pfloat weight_value = ((float*)(cp+bytes_scanned+40))[2*i+1];
-		if (params_memory_cpu->at(weight_index) != 0.0f)
-		    printf("i=%d weight_index=%u, weight_value=%.8e (replace %.8e)\n",i,weight_index,weight_value.convert_to<float>(),params_memory_cpu->at(weight_index).convert_to<float>());
-		params_memory_cpu->at(weight_index) = weight_value;
+		float weight_value = ((float*)(cp+bytes_scanned+40))[2*i+1];
+		params_memory_cpu[weight_index] = weight_value;
 	    }
 	    bytes_scanned += 40+n_cp_weights*8;
 	}
     }
+    
     // copy them to the model
-    //memcpy(model->params_memory, params_memory_cpu, num_parameters_bytes);
-    //free(params_memory_cpu);
+    memcpy(model->params_memory, params_memory_cpu, num_parameters_bytes);
+    free(params_memory_cpu);
     //model->params_memory = params_memory_cpu;
 }
 
@@ -911,43 +997,43 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
-    pfloat* residual;
+    float* residual;
     encoder_forward(acts.encoded, inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
     for (int l = 0; l < L; l++) {
 
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
         // get the pointers of the weights for this layer
-        pfloat* l_ln1w = params.ln1w + l * C;
-        pfloat* l_ln1b = params.ln1b + l * C;
-        pfloat* l_qkvw = params.qkvw + l * 3*C * C;
-        pfloat* l_qkvb = params.qkvb + l * 3*C;
-        pfloat* l_attprojw = params.attprojw + l * C * C;
-        pfloat* l_attprojb = params.attprojb + l * C;
-        pfloat* l_ln2w = params.ln2w + l * C;
-        pfloat* l_ln2b = params.ln2b + l * C;
-        pfloat* l_fcw = params.fcw + l * 4*C * C;
-        pfloat* l_fcb = params.fcb + l * 4*C;
-        pfloat* l_fcprojw = params.fcprojw + l * C * 4*C;
-        pfloat* l_fcprojb = params.fcprojb + l * C;
+        float* l_ln1w = params.ln1w + l * C;
+        float* l_ln1b = params.ln1b + l * C;
+        float* l_qkvw = params.qkvw + l * 3*C * C;
+        float* l_qkvb = params.qkvb + l * 3*C;
+        float* l_attprojw = params.attprojw + l * C * C;
+        float* l_attprojb = params.attprojb + l * C;
+        float* l_ln2w = params.ln2w + l * C;
+        float* l_ln2b = params.ln2b + l * C;
+        float* l_fcw = params.fcw + l * 4*C * C;
+        float* l_fcb = params.fcb + l * 4*C;
+        float* l_fcprojw = params.fcprojw + l * C * 4*C;
+        float* l_fcprojb = params.fcprojb + l * C;
 
         // get the pointers of the activations for this layer
-        pfloat* l_ln1 = acts.ln1 + l * B * T * C;
-        pfloat* l_ln1_mean = acts.ln1_mean + l * B * T;
-        pfloat* l_ln1_rstd = acts.ln1_rstd + l * B * T;
-        pfloat* l_qkv = acts.qkv + l * B * T * 3*C;
-        pfloat* l_atty = acts.atty + l * B * T * C;
-        pfloat* l_preatt = acts.preatt + l * B * NH * T * T;
-        pfloat* l_att = acts.att + l * B * NH * T * T;
-        pfloat* l_attproj = acts.attproj + l * B * T * C;
-        pfloat* l_residual2 = acts.residual2 + l * B * T * C;
-        pfloat* l_ln2 = acts.ln2 + l * B * T * C;
-        pfloat* l_ln2_mean = acts.ln2_mean + l * B * T;
-        pfloat* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        pfloat* l_fch = acts.fch + l * B * T * 4*C;
-        pfloat* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
-        pfloat* l_fcproj = acts.fcproj + l * B * T * C;
-        pfloat* l_residual3 = acts.residual3 + l * B * T * C;
+        float* l_ln1 = acts.ln1 + l * B * T * C;
+        float* l_ln1_mean = acts.ln1_mean + l * B * T;
+        float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
+        float* l_qkv = acts.qkv + l * B * T * 3*C;
+        float* l_atty = acts.atty + l * B * T * C;
+        float* l_preatt = acts.preatt + l * B * NH * T * T;
+        float* l_att = acts.att + l * B * NH * T * T;
+        float* l_attproj = acts.attproj + l * B * T * C;
+        float* l_residual2 = acts.residual2 + l * B * T * C;
+        float* l_ln2 = acts.ln2 + l * B * T * C;
+        float* l_ln2_mean = acts.ln2_mean + l * B * T;
+        float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
+        float* l_fch = acts.fch + l * B * T * 4*C;
+        float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
+        float* l_fcproj = acts.fcproj + l * B * T * C;
+        float* l_residual3 = acts.residual3 + l * B * T * C;
 
         // now do the forward pass
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
@@ -970,7 +1056,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     if (targets != NULL) {
         crossentropy_forward(model->acts.losses, model->acts.probs, targets, B, T, Vp);
         // for convenience also evaluate the mean loss
-        pfloat mean_loss = 0.0f;
+        float mean_loss = 0.0f;
         for (int i=0; i<B*T; i++) {
 	    mean_loss += model->acts.losses[i];
 	}
@@ -983,16 +1069,8 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
 }
 
 void gpt2_zero_grad(GPT2 *model) {
-    if(model->grads_memory != NULL) {
-	//memset(model->grads_memory, 0, model->num_parameters * sizeof(pfloat));
-	for (size_t i=0; i<model->num_parameters; i++)
-	    (model->grads_memory)->at(i) = 0;
-    }
-    if(model->grads_acts_memory != NULL) {
-	//memset(model->grads_acts_memory, 0, model->num_activations * sizeof(pfloat));
-	for (size_t i=0; i<model->num_activations; i++)
-	    (model->grads_acts_memory)->at(i) = 0;
-    }
+    if(model->grads_memory != NULL) { memset(model->grads_memory, 0, model->num_parameters * sizeof(float)); }
+    if(model->grads_acts_memory != NULL) { memset(model->grads_acts_memory, 0, model->num_activations * sizeof(float)); }
 }
 
 void gpt2_backward(GPT2 *model) {
@@ -1028,13 +1106,13 @@ void gpt2_backward(GPT2 *model) {
     // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
     // technically this is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
-    pfloat dloss_mean = 1.0f / (B*T);
+    float dloss_mean = 1.0f / (B*T);
     for (int i = 0; i < B*T; i++) { grads_acts.losses[i] = dloss_mean; }
 
     crossentropy_softmax_backward(grads_acts.logits, grads_acts.losses, acts.probs, model->targets, B, T, V, Vp);
     matmul_backward(grads_acts.lnf, grads.wte, NULL, grads_acts.logits, acts.lnf, params.wte, B, T, C, Vp);
-    pfloat* residual = acts.residual3 + (L-1) * B * T * C; // last layer's residual
-    pfloat* dresidual = grads_acts.residual3 + (L-1) * B * T * C; // write to last layer's residual
+    float* residual = acts.residual3 + (L-1) * B * T * C; // last layer's residual
+    float* dresidual = grads_acts.residual3 + (L-1) * B * T * C; // write to last layer's residual
     layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.lnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
 
     for (int l = L-1; l >= 0; l--) {
@@ -1043,51 +1121,51 @@ void gpt2_backward(GPT2 *model) {
         dresidual = l == 0 ? grads_acts.encoded : grads_acts.residual3 + (l-1) * B * T * C;
 
         // get the pointers of the weights for this layer
-        pfloat* l_ln1w = params.ln1w + l * C;
-        pfloat* l_qkvw = params.qkvw + l * 3*C * C;
-        pfloat* l_attprojw = params.attprojw + l * C * C;
-        pfloat* l_ln2w = params.ln2w + l * C;
-        pfloat* l_fcw = params.fcw + l * 4*C * C;
-        pfloat* l_fcprojw = params.fcprojw + l * C * 4*C;
+        float* l_ln1w = params.ln1w + l * C;
+        float* l_qkvw = params.qkvw + l * 3*C * C;
+        float* l_attprojw = params.attprojw + l * C * C;
+        float* l_ln2w = params.ln2w + l * C;
+        float* l_fcw = params.fcw + l * 4*C * C;
+        float* l_fcprojw = params.fcprojw + l * C * 4*C;
         // get the pointers of the gradients of the weights for this layer
-        pfloat* dl_ln1w = grads.ln1w + l * C;
-        pfloat* dl_ln1b = grads.ln1b + l * C;
-        pfloat* dl_qkvw = grads.qkvw + l * 3*C * C;
-        pfloat* dl_qkvb = grads.qkvb + l * 3*C;
-        pfloat* dl_attprojw = grads.attprojw + l * C * C;
-        pfloat* dl_attprojb = grads.attprojb + l * C;
-        pfloat* dl_ln2w = grads.ln2w + l * C;
-        pfloat* dl_ln2b = grads.ln2b + l * C;
-        pfloat* dl_fcw = grads.fcw + l * 4*C * C;
-        pfloat* dl_fcb = grads.fcb + l * 4*C;
-        pfloat* dl_fcprojw = grads.fcprojw + l * C * 4*C;
-        pfloat* dl_fcprojb = grads.fcprojb + l * C;
+        float* dl_ln1w = grads.ln1w + l * C;
+        float* dl_ln1b = grads.ln1b + l * C;
+        float* dl_qkvw = grads.qkvw + l * 3*C * C;
+        float* dl_qkvb = grads.qkvb + l * 3*C;
+        float* dl_attprojw = grads.attprojw + l * C * C;
+        float* dl_attprojb = grads.attprojb + l * C;
+        float* dl_ln2w = grads.ln2w + l * C;
+        float* dl_ln2b = grads.ln2b + l * C;
+        float* dl_fcw = grads.fcw + l * 4*C * C;
+        float* dl_fcb = grads.fcb + l * 4*C;
+        float* dl_fcprojw = grads.fcprojw + l * C * 4*C;
+        float* dl_fcprojb = grads.fcprojb + l * C;
         // get the pointers of the activations for this layer
-        pfloat* l_ln1 = acts.ln1 + l * B * T * C;
-        pfloat* l_ln1_mean = acts.ln1_mean + l * B * T;
-        pfloat* l_ln1_rstd = acts.ln1_rstd + l * B * T;
-        pfloat* l_qkv = acts.qkv + l * B * T * 3*C;
-        pfloat* l_atty = acts.atty + l * B * T * C;
-        pfloat* l_att = acts.att + l * B * NH * T * T;
-        pfloat* l_residual2 = acts.residual2 + l * B * T * C;
-        pfloat* l_ln2 = acts.ln2 + l * B * T * C;
-        pfloat* l_ln2_mean = acts.ln2_mean + l * B * T;
-        pfloat* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        pfloat* l_fch = acts.fch + l * B * T * 4*C;
-        pfloat* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
+        float* l_ln1 = acts.ln1 + l * B * T * C;
+        float* l_ln1_mean = acts.ln1_mean + l * B * T;
+        float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
+        float* l_qkv = acts.qkv + l * B * T * 3*C;
+        float* l_atty = acts.atty + l * B * T * C;
+        float* l_att = acts.att + l * B * NH * T * T;
+        float* l_residual2 = acts.residual2 + l * B * T * C;
+        float* l_ln2 = acts.ln2 + l * B * T * C;
+        float* l_ln2_mean = acts.ln2_mean + l * B * T;
+        float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
+        float* l_fch = acts.fch + l * B * T * 4*C;
+        float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
         // get the pointers of the gradients of the activations for this layer
-        pfloat* dl_ln1 = grads_acts.ln1 + l * B * T * C;
-        pfloat* dl_qkv = grads_acts.qkv + l * B * T * 3*C;
-        pfloat* dl_atty = grads_acts.atty + l * B * T * C;
-        pfloat* dl_preatt = grads_acts.preatt + l * B * NH * T * T;
-        pfloat* dl_att = grads_acts.att + l * B * NH * T * T;
-        pfloat* dl_attproj = grads_acts.attproj + l * B * T * C;
-        pfloat* dl_residual2 = grads_acts.residual2 + l * B * T * C;
-        pfloat* dl_ln2 = grads_acts.ln2 + l * B * T * C;
-        pfloat* dl_fch = grads_acts.fch + l * B * T * 4*C;
-        pfloat* dl_fch_gelu = grads_acts.fch_gelu + l * B * T * 4*C;
-        pfloat* dl_fcproj = grads_acts.fcproj + l * B * T * C;
-        pfloat* dl_residual3 = grads_acts.residual3 + l * B * T * C;
+        float* dl_ln1 = grads_acts.ln1 + l * B * T * C;
+        float* dl_qkv = grads_acts.qkv + l * B * T * 3*C;
+        float* dl_atty = grads_acts.atty + l * B * T * C;
+        float* dl_preatt = grads_acts.preatt + l * B * NH * T * T;
+        float* dl_att = grads_acts.att + l * B * NH * T * T;
+        float* dl_attproj = grads_acts.attproj + l * B * T * C;
+        float* dl_residual2 = grads_acts.residual2 + l * B * T * C;
+        float* dl_ln2 = grads_acts.ln2 + l * B * T * C;
+        float* dl_fch = grads_acts.fch + l * B * T * 4*C;
+        float* dl_fch_gelu = grads_acts.fch_gelu + l * B * T * 4*C;
+        float* dl_fcproj = grads_acts.fcproj + l * B * T * C;
+        float* dl_residual3 = grads_acts.residual3 + l * B * T * C;
 
         // backprop this layer
         residual_backward(dl_residual2, dl_fcproj, dl_residual3, B*T*C);
@@ -1104,392 +1182,312 @@ void gpt2_backward(GPT2 *model) {
     encoder_backward(grads.wte, grads.wpe, grads_acts.encoded, model->inputs, B, T, C);
 }
 
-void gpt2_update(GPT2 *model, pfloat learning_rate, pfloat beta1, pfloat beta2, pfloat eps, pfloat weight_decay, int t) {
+void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
     // reference: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
 
     //printf("gpt2_update(): beta1=%.2e, beta2=%.2e, weight_decay=%.2e\n",beta1,beta2,weight_decay);
     
     // lazily allocate the memory for m_memory and v_memory
     if (model->m_memory == NULL) {
-        //model->m_memory = (pfloat*)calloc(model->num_parameters, sizeof(pfloat));
-        //model->v_memory = (pfloat*)calloc(model->num_parameters, sizeof(pfloat));
-	model->m_memory = new std::vector<pfloat>(model->num_parameters);
-	model->v_memory = new std::vector<pfloat>(model->num_parameters);
+        model->m_memory = (float*)calloc(model->num_parameters, sizeof(float));
+        model->v_memory = (float*)calloc(model->num_parameters, sizeof(float));
     }
 
     for (size_t i = 0; i < model->num_parameters; i++) {
 	if (!model->params_memory_active[i])
 	    continue;
-        pfloat param = model->params_memory->at(i);
-        pfloat grad = model->grads_memory->at(i);
+        float param = model->params_memory[i];
+        float grad = model->grads_memory[i];
 
         // update the first moment (momentum)
-        pfloat m = beta1 * model->m_memory->at(i) + (1.0f - beta1) * grad;
+        float m = beta1 * model->m_memory[i] + (1.0f - beta1) * grad;
         // update the second moment (RMSprop)
-        pfloat v = beta2 * model->v_memory->at(i) + (1.0f - beta2) * grad * grad;
+        float v = beta2 * model->v_memory[i] + (1.0f - beta2) * grad * grad;
         // bias-correct both moments
-        pfloat m_hat = m / (1.0f - pow(beta1, t));
-        pfloat v_hat = v / (1.0f - pow(beta2, t));
+        float m_hat = m / (1.0f - powf(beta1, t));
+        float v_hat = v / (1.0f - powf(beta2, t));
 
 	//printf("update param %lu (%.2e) with m_hat = %.2e (grad %.2e)\n",i,param,m_hat,grad);
 
         // update
-        model->m_memory->at(i) = m;
-        model->v_memory->at(i) = v;
-        model->params_memory->at(i) -= learning_rate * (m_hat / (sqrt(v_hat) + eps) + weight_decay * param);
+        model->m_memory[i] = m;
+        model->v_memory[i] = v;
+        model->params_memory[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * param);
     }
 }
 
 void gpt2_free(GPT2 *model) {
-    model->params_memory->clear();
-    printf("clear grads_memory\n");
-    if (model->grads_memory) model->grads_memory->clear();
-    printf("clear m_memory\n");
-    if (model->m_memory) model->m_memory->clear();
-    printf("clear v_memory\n");
-    if (model->v_memory) model->v_memory->clear();
-    printf("clear acts_memory\n");
-    if (model->acts_memory) model->acts_memory->clear();
-    printf("clear grads_acts_memory\n");
-    if (model->grads_acts_memory) model->grads_acts_memory->clear();
-    printf("gpt2_free(): free inputs\n");
+    free(model->params_memory);
+    free(model->grads_memory);
+    free(model->m_memory);
+    free(model->v_memory);
+    free(model->acts_memory);
+    free(model->grads_acts_memory);
     free(model->inputs);
     free(model->targets);
     free(model->active_weights);
     free(model->params_memory_active);
 }
 
-#ifndef TESTING
-// if we are TESTING (see test_gpt2.c), we'll skip the int main below
+
 // ----------------------------------------------------------------------------
-// sampler
+// chain verifier (float port of the logic in eval_gpt2_btm.c)
 
-unsigned int random_u32(uint64_t *state) {
-    // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
-    *state ^= *state >> 12;
-    *state ^= *state << 25;
-    *state ^= *state >> 27;
-    return (*state * 0x2545F4914F6CDD1Dull) >> 32;
-}
-pfloat random_f32(uint64_t *state) { // random pfloat32 in [0,1)
-    return (random_u32(state) >> 8) / 16777216.0f;
-}
+// Rebuild the exact model that the chain (cp = contents of btm-cp.bin) commits to.
+// Unlike training, no RNG is needed: every weight that was ever trained is stored with
+// its exact float bit pattern in some chain record, and all remaining weights are
+// deterministic constants (layernorm params 1.0, everything else 0.0). So the model is
+// reconstructed as: all zeros -> layernorm params = 1 -> apply every record in order.
+void gpt2_build_from_chain(GPT2 *model, int depth, uchar* cp, size_t cp_bytes) {
 
-int sample_mult(pfloat* probabilities, int n, pfloat coin) {
-    // sample index from probabilities (they must sum to 1!)
-    // coin is a random number in [0, 1), usually from random_f32()
-    pfloat cdf = 0.0f;
-    for (int i = 0; i < n; i++) {
-        cdf += probabilities[i];
-        if (coin < cdf) {
-            return i;
-        }
+    // parameterize the size of gpt2 based only on the depth of the model (num_layers)
+    model->config.num_layers = depth;
+    // follows GPT-2 sizes
+    int channels, num_heads;
+    if      (depth == 6)  { channels = 384; num_heads = 6; } // gpt2-tiny (30M)
+    else if (depth == 12) { channels = 768; num_heads = 12; } // gpt2 (124M)
+    else if (depth == 24) { channels = 1024; num_heads = 16; } // gpt2-medium (350M)
+    else if (depth == 36) { channels = 1280; num_heads = 20; } // gpt2-large (774M)
+    else if (depth == 48) { channels = 1600; num_heads = 25; } // gpt2-xl (1558M)
+    else { fprintf(stderr, "Unsupported depth for now\n"); exit(EXIT_FAILURE); }
+    model->config.channels = channels;
+    model->config.num_heads = num_heads;
+    model->config.max_seq_len = 1024;
+    model->config.vocab_size = 50257;
+    model->config.padded_vocab_size = 50304; // padded to 128
+
+    // fill in all the parameter tensor dimensions and allocate
+    fill_in_parameter_sizes(model->param_sizes, model->config);
+    model->num_parameters = 0;
+    size_t num_parameters_bytes = 0;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        model->num_parameters += model->param_sizes[i];
+        num_parameters_bytes += model->param_sizes[i] * sizeof(float);
     }
-    return n - 1; // in case of rounding errors
+    model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes);
+
+    model->acts_memory = NULL;
+    model->grads_memory = NULL;
+    model->m_memory = NULL;
+    model->v_memory = NULL;
+    model->grads_acts_memory = NULL;
+    model->inputs = NULL;
+    model->targets = NULL;
+    model->batch_size = 0;
+    model->seq_len = 0;
+    model->mean_loss = -1.0f; // -1.0f will designate no loss
+    model->active_weights = NULL;
+    model->n_active_weights = 0;
+    model->params_memory_active = NULL;
+
+    // all zeros, then the layernorm scale tensors (ln1w=2, ln2w=8, lnfw=14) to 1.0
+    float* p = model->params_memory;
+    memset(p, 0, num_parameters_bytes);
+    size_t offset = 0;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        if (i == 2 || i == 8 || i == 14) {
+            for (size_t j = 0; j < model->param_sizes[i]; j++) p[offset + j] = 1.0f;
+        }
+        offset += model->param_sizes[i];
+    }
+
+    // apply checkpoint data: walk the chain file record by record and write each record's
+    // (index,value) pairs into the parameter buffer. Records are applied oldest-first, so
+    // if a later record retrained a weight index, the newer value wins.
+    // Record layout: <32B hash><8B count N><N x (uint32 index, float32 value)> = 40+8N bytes.
+    if (cp_bytes % 8 != 0) {
+        printf("Warning: The size of the checkpoint data is not a multiple of 8. Ignoring it.\n");
+        return;
+    }
+    size_t bytes_scanned = 0;
+    while (bytes_scanned < cp_bytes) {
+        uint64_t n_cp_weights; // count field N of this record (explicit width: wasm32 size_t is 4 bytes)
+        memcpy(&n_cp_weights, cp + bytes_scanned + 32, 8);
+        for (uint64_t i = 0; i < n_cp_weights; i++) {
+            uint32_t weight_index;
+            float weight_value;
+            memcpy(&weight_index, cp + bytes_scanned + 40 + i*8, 4);
+            memcpy(&weight_value, cp + bytes_scanned + 40 + i*8 + 4, 4);
+            p[weight_index] = weight_value;
+        }
+        bytes_scanned += (size_t)(40 + n_cp_weights*8);
+    }
 }
 
-// ----------------------------------------------------------------------------
-// main training loop
-//int main(int argc, char** argv) {
 // The verifier: rebuild the model the chain commits to, recompute the last record's
-// chained hash, re-derive the val batch it selected, and compute the loss -- entirely in
-// pfloat (MPFR) so that every node, on any hardware, gets the same loss bit for bit.
-// This loss is the canonical, consensus-grade score of the record. (rng_seed_1/2 are
-// unused here: unlike training, nothing about the model depends on miner-chosen seeds.)
-int gpt2_eval(pfloat* ploss, uchar* block_hash, uchar* cp, size_t cp_bytes, int depth, size_t n_active_weights, unsigned int rng_seed_1, unsigned int rng_seed_2) {
+// chained hash, re-derive the val batch it selected, and compute the loss in float32.
+// Compiled to wasm, this loss is bit-for-bit identical on every node (see file banner).
+int gpt2_eval(float* ploss, uchar* block_hash, uchar* cp, size_t cp_bytes, int depth) {
 
     GPT2 model;
-    //gpt2_build_from_checkpoint(&model, "gpt2_124M.bin"); // to build from CP
-    gpt2_build_from_checkpoint(&model,depth,cp,cp_bytes);
+    gpt2_build_from_chain(&model, depth, cp, cp_bytes);
 
-    // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
+    // token file: same selection logic as miner and pfloat verifier
     const char* tiny_stories_train = "dev/data/tinystories/TinyStories_train.bin";
-    const char* tiny_stories_val = "dev/data/tinystories/TinyStories_val.bin";
     const char* tiny_shakespeare_train = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
-    const char* tiny_shakespeare_val = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
-    //const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
-    int B = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
-    int T = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
-    DataLoader train_loader, val_loader; // using subsets random subsets of training set for validation
-    dataloader_init(&train_loader, train_tokens, B, T, 0, 1, 1);
-    dataloader_init(&val_loader, train_tokens, B, T, 0, 1, 1); // val same as train
-        
-    printf("train dataset num_batches: %zu\n", train_loader.num_tokens / (B*T));
-    //printf("val dataset num_batches: %zu\n", val_loader.num_tokens / (B*T));
-    int val_num_batches = 1;
-
-    // build the Tokenizer
-    Tokenizer tokenizer;
-    tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
-    
-    // some memory for generating samples from the model
-    uint64_t rng_state = 1337;
-    int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
-    const int genT = 64; // number of steps of inference we will do
+    int B = 4;
+    int T = 64;
+    DataLoader val_loader;
+    dataloader_init(&val_loader, train_tokens, B, T, 0, 1, 1);
 
     // Reconstruct the hash PREIMAGE of the last record in the chain file, so we can
     // recompute its chained hash and re-derive the val batch it committed to.
-    //
-    // Chain file = a sequence of records, each 40+8N bytes:
-    //   <32B hash><8B count N><N x (uint32 index, float32 value)>
-    // Subtlety: the 32 bytes at the head of a record ON DISK are that record's OWN
-    // chained hash -- the miner overwrites the head with SHA256d(record) just before
-    // appending it (see gpt2_train). But the preimage that PRODUCED this hash had the
-    // PREVIOUS record's hash at the head (or, for the very first record, the Bitmark
-    // block hash the miner was anchored to). So to verify record k we splice:
-    //   weight_state = <head of record k-1> || <count + weights of record k>
-    //
-    // We walk the file record by record -- we can't jump straight to the last record
-    // because each record's size depends on its own count field -- remembering the
-    // previous record's size so we can point back at its head once we find the last
-    // record (recognized by it ending exactly at end-of-file).
+    // The 32 bytes at the head of a record ON DISK are that record's OWN chained hash;
+    // the preimage that PRODUCED it had the PREVIOUS record's hash at the head (or, for
+    // the first record, the Bitmark block hash the miner was anchored to). So to verify
+    // record k we splice: weight_state = <head of record k-1> || <count+weights of record k>.
+    // We walk the file because each record's size depends on its own count field.
     uchar* weight_state = 0;
     size_t weight_state_bytes = 0;
+    size_t last_record_off = 0;
     size_t bytes_scanned = 0;
-    size_t n_cp_weights_prev = 0;
+    uint64_t n_cp_weights_prev = 0;
     while (bytes_scanned < cp_bytes) {
-	size_t n_cp_weights = *((size_t*)(cp+bytes_scanned+32)); // count field N of this record
-	if (bytes_scanned+40+n_cp_weights*8 == cp_bytes) { // record ends at EOF: it's the last one
-	    weight_state_bytes = 40+n_cp_weights*8;
-	    weight_state = (uchar*)malloc(weight_state_bytes);
-	    if (n_cp_weights_prev>0) { /* head of previous record = its chained hash = our prev-hash */
-		memcpy(weight_state,cp+bytes_scanned-8*n_cp_weights_prev-40,32);
-	    }
-	    else if (block_hash) { /* first record: prev hash is the block hash given at training time */
-		memcpy(weight_state,block_hash,32);
-	    }
-	    else { /* first record of a chain mined without a block hash: genesis marker */
-		memset(weight_state,255,32);
-	    }
-	    memcpy(weight_state+32,cp+bytes_scanned+32,weight_state_bytes-32); // count + weights, unchanged
-	}
-	bytes_scanned += 40+8*n_cp_weights;
-	n_cp_weights_prev = n_cp_weights;
+        uint64_t n_cp_weights; // count field N of this record
+        memcpy(&n_cp_weights, cp + bytes_scanned + 32, 8);
+        if (bytes_scanned + 40 + n_cp_weights*8 == cp_bytes) { // record ends at EOF: it's the last one
+            weight_state_bytes = (size_t)(40 + n_cp_weights*8);
+            weight_state = (uchar*)mallocCheck(weight_state_bytes);
+            last_record_off = bytes_scanned;
+            if (n_cp_weights_prev > 0) { /* head of previous record = its chained hash = our prev-hash */
+                memcpy(weight_state, cp + bytes_scanned - (size_t)(8*n_cp_weights_prev) - 40, 32);
+            }
+            else if (block_hash) { /* first record: prev hash is the block hash given at training time */
+                memcpy(weight_state, block_hash, 32);
+            }
+            else { /* first record of a chain mined without a block hash: genesis marker */
+                memset(weight_state, 255, 32);
+            }
+            memcpy(weight_state+32, cp + bytes_scanned + 32, weight_state_bytes - 32); // count + weights, unchanged
+        }
+        bytes_scanned += (size_t)(40 + 8*n_cp_weights);
+        n_cp_weights_prev = n_cp_weights;
+    }
+    if (!weight_state) {
+        printf("error: no complete record found in the chain data\n");
+        return 1;
     }
 
-    struct timespec start, end;
-    int n_steps = 0;
-    for (int step = 0; step <= n_steps; step++) {
-
-        // once in a while estimate the validation loss
-        if (step == n_steps) {
-
-	    // recompute the chained hash: hash2 = SHA256(SHA256(prev_hash || count || weights)).
-	    // This must reproduce, bit for bit, the hash the miner computed and stored at the
-	    // head of this record on disk -- compare the debug output below with the miner's.
-	    unsigned int hash [8]; // hash is 256 bit = 8*32 bit
-	    unsigned int hash2 [8];
-	    printf("Do SHA256 of:\n");
-	    for (int i=0; i<32; i++) {
-		printf(" %02x",weight_state[i]);
-	    }
-	    printf("\n");
-	    printf("%zu\n",*((size_t*)(weight_state+32)));
-	    for (int i=0; i<128; i++) {
-		printf("%u ",*((uint32_t*)(weight_state+40+i*8)));
-		printf("%.8e\n",*((float*)(weight_state+40+i*8+4)));
-	    }
-	    printf("...\n");
-	    SHA256(weight_state,weight_state_bytes,(uchar*)hash);
-	    /*printf("hash =");
-	    for (int i=0; i<4; i++)
-		printf(" %u",((uchar*)hash)[i]);
-		printf("\n");*/
-	    SHA256((uchar*)hash,32,(uchar*)hash2);
-	    printf("hash2 =");
-	    for (int i=0; i<4; i++)
-		printf(" %u",((uchar*)hash2)[i]);
-	    printf("\n");
-	    // the hash selects the val batch (commit-then-evaluate): since the weights are
-	    // inside the hash preimage, the miner could not have known which batch it would
-	    // be scored on until its weights were already fixed -- no overfitting a known batch.
-	    // set seed to first 4 bytes of hash (todo: use full 32 bytes)
-	    manual_seed(&(val_loader.shuffle_rng),*hash2);
-	  
-            pfloat val_loss = 0.0f;
-            dataloader_reset(&val_loader);
-            for (int i = 0; i < val_num_batches; i++) {
-                dataloader_next_batch(&val_loader);
-		printf("inputs:");
-		for (int j=0; j<B*T; j++) {
-		    printf(" %d",val_loader.inputs[j]);
-		}
-		printf("\n");
-		gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
-                val_loss += model.mean_loss;
-            }
-            val_loss /= val_num_batches;
-            printf("val loss %f\n", val_loss.convert_to<float>());
-	    if (step == n_steps) { // return results
-		*ploss = val_loss;
-		dataloader_free(&train_loader);
-		dataloader_free(&val_loader);
-		tokenizer_free(&tokenizer);
-		gpt2_free(&model);
-		free(gen_tokens);
-		if (weight_state) free(weight_state);
-		return 0;
-	    }
-        }
-
-        // once in a while do model inference to print generated text
-        if (step > 0 && step % 20 == 0 && 0) { // disable for now
-            // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
-            for(int i = 0; i < B * T; ++i) {
-                gen_tokens[i] = tokenizer.eot_token;
-            }
-            // now sample from the model autoregressively
-            printf("generating:\n---\n");
-            for (int t = 1; t < genT; t++) {
-                // note that inference is very wasteful here because for each token
-                // we re-calculate the forward pass for all of (B,T) positions from scratch
-                // but the inference here is just for sanity checking anyway
-                // and we can maybe optimize a bit more later, with careful tests
-                gpt2_forward(&model, gen_tokens, NULL, B, T);
-                // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
-                // we're in principle running B "inference streams" in parallel here
-                // but only using position 0
-                // get the Vp-dimensional vector probs[0, t-1, :]
-                pfloat* probs = model.acts.probs + (t-1) * model.config.padded_vocab_size;
-                pfloat coin = random_f32(&rng_state);
-                // note we're only sampling from the first V elements, ignoring padding
-                // (the probabilities in the padded region should be zero anyway)
-                int next_token = sample_mult(probs, model.config.vocab_size, coin);
-                gen_tokens[t] = next_token;
-                // print the generated token, either using the Tokenizer or a fallback
-                if (tokenizer.init_ok) {
-                    const char* token_str = tokenizer_decode(&tokenizer, next_token);
-                    safe_printf(token_str);
-                } else {
-                    // fall back to printing the token id
-                    printf("%d ", next_token);
-                }
-                fflush(stdout);
-            }
-            printf("\n---\n");
-        }
-
-        // do a training step
-        clock_gettime(CLOCK_MONOTONIC, &start);
-        dataloader_next_batch(&train_loader);
-        gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
-        gpt2_zero_grad(&model);
-        gpt2_backward(&model);
-        gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
-        clock_gettime(CLOCK_MONOTONIC, &end);
-        double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-        printf("step %d: train loss %f (took %f ms)\n", step, model.mean_loss.convert_to<float>(), time_elapsed_s * 1000);
+    // recompute the chained hash: hash2 = SHA256(SHA256(prev_hash || count || weights)).
+    // Debug output below is format-compatible with the miner and the pfloat verifier.
+    printf("Do SHA256 of:\n");
+    for (int i = 0; i < 32; i++) {
+        printf(" %02x", weight_state[i]);
+    }
+    printf("\n");
+    uint64_t ws_count;
+    memcpy(&ws_count, weight_state+32, 8);
+    printf("%llu\n", (unsigned long long)ws_count);
+    int n_show = ws_count < 128 ? (int)ws_count : 128;
+    for (int i = 0; i < n_show; i++) {
+        uint32_t wi;
+        float wv;
+        memcpy(&wi, weight_state + 40 + i*8, 4);
+        memcpy(&wv, weight_state + 40 + i*8 + 4, 4);
+        printf("%u ", wi);
+        printf("%.8e\n", wv);
+    }
+    printf("...\n");
+    uchar hash[32];
+    uchar hash2[32];
+    sha256_hash(weight_state, weight_state_bytes, hash);
+    sha256_hash(hash, 32, hash2);
+    printf("hash2 =");
+    for (int i = 0; i < 4; i++)
+        printf(" %u", hash2[i]);
+    printf("\n");
+    // self-check: the recomputed hash must equal the head of the record as stored on disk
+    if (memcmp(hash2, cp + last_record_off, 32) == 0) {
+        printf("chained hash matches the record head in the chain file\n");
+    } else {
+        printf("WARNING: chained hash does NOT match the record head (wrong block hash argument?)\n");
     }
 
-    // free
-    dataloader_free(&train_loader);
+    // the hash selects the val batch (commit-then-evaluate); first 4 bytes as seed,
+    // little-endian on all supported hosts incl. wasm (todo: use full 32 bytes)
+    unsigned int seed;
+    memcpy(&seed, hash2, 4);
+    manual_seed(&(val_loader.shuffle_rng), seed);
+
+    float val_loss = 0.0f;
+    dataloader_reset(&val_loader);
+    int val_num_batches = 1;
+    for (int i = 0; i < val_num_batches; i++) {
+        dataloader_next_batch(&val_loader);
+        printf("inputs:");
+        for (int j = 0; j < B*T; j++) {
+            printf(" %d", val_loader.inputs[j]);
+        }
+        printf("\n");
+        gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
+        val_loss += model.mean_loss;
+    }
+    val_loss /= val_num_batches;
+    printf("val loss %f\n", val_loss);
+    // exact bit pattern, for cross-machine determinism checks
+    uint32_t loss_bits;
+    memcpy(&loss_bits, &val_loss, 4);
+    printf("val loss bits = %08x\n", loss_bits);
+
+    *ploss = val_loss;
     dataloader_free(&val_loader);
-    tokenizer_free(&tokenizer);
     gpt2_free(&model);
-    free(gen_tokens);
-    if (weight_state) free(weight_state);
+    free(weight_state);
     return 0;
 }
+
 int main(int argc, char** argv) {
 
-    // system assumptions (can be relaxed later)
+    // format-parsing assumptions (note: deliberately NO sizeof(size_t)==8 assert --
+    // wasm32 has 32-bit size_t; all chain-format fields are read with explicit widths)
     assert(CHAR_BIT == 8);
-    assert(CHAR_BIT * sizeof(float) == 32);
-    assert(CHAR_BIT * sizeof(unsigned int) == 32);
-    assert(CHAR_BIT * sizeof(size_t) == 64);
-    const int n = 1;
-    assert( (*(char*)&n) != 0 ); // little endian
-    
-
-    //boost::multiprecision::mpfr_float::default_precision(8);
-    std::cout << std::fixed;
-    std::cout.precision(20);
-
-    //pfloat a = 2;
-    //pfloat c = 1000000;
-    //pfloat b = sqrt(a/c);
-    //std::cout << b << std::endl;
-
-    //float a_f = mpfr_get_flt(a.m_data,MPFR_RNDN);
-    //float b_f = b.convert_to<float>();
-    //printf("b_f = %.20e\n",b_f);
-
-    struct timespec ts;
-    timespec_get(&ts,TIME_UTC);
-    printf("unix time = %lu\n",ts.tv_sec);
+    assert(sizeof(float) == 4);
+    assert(sizeof(unsigned int) == 4);
+    const int one = 1;
+    assert( (*(const char*)&one) != 0 ); // little endian
 
     uchar* block_hash = 0;
-    if (argc>1) {
-	int len = hex_to_uchar(&block_hash,argv[1]);
-	if (len>0) {
-	    if (len != 32) {
-		printf("block hash length must be 32 bytes (length 64 hex string)\n");
-		exit(1);
-	    }
-	    printf("have block_hash =");
-	    for (int i=0; i<32; i++)
-		printf(" %02x",block_hash[i]);
-	    printf("\n");
-	}
+    if (argc > 1) {
+        size_t len = hex_to_uchar(&block_hash, argv[1]);
+        if (len > 0) {
+            if (len != 32) {
+                printf("block hash length must be 32 bytes (length 64 hex string)\n");
+                exit(1);
+            }
+            printf("have block_hash =");
+            for (int i = 0; i < 32; i++)
+                printf(" %02x", block_hash[i]);
+            printf("\n");
+        }
     }
     int depth = 12;
-    if (argc>2)
-	depth = atoi(argv[2]);
-    size_t n_active_weights = 62000;
-    if (argc>3)
-	n_active_weights = atoi(argv[3]);
-    unsigned int rng_seed_offset = ts.tv_sec;
-    if (argc>4)
-	rng_seed_offset = atoi(argv[4]);
+    if (argc > 2)
+        depth = atoi(argv[2]);
 
-    size_t weight_state_bytes = n_active_weights*8+40;
-    
-    const char* cpfname = "btm-cp.bin"; // checkpoint file name
-    FILE* cpf = fopen(cpfname,"rb");
-    uchar* cp = 0;
-    size_t cp_bytes = 0;
-    if (cpf) {
-	printf("train from checkpoint\n");
-	fseek(cpf,0L,SEEK_END);
-	cp_bytes = ftell(cpf);
-	fseek(cpf,0L,SEEK_SET);
-	cp = (uchar*)malloc(cp_bytes);
-	int ret = fread(cp,1,cp_bytes,cpf);
-	fclose(cpf);
-    }
-
-    printf("cp_bytes = %lu\n",cp_bytes);
-
-    int n_sweeps = 1; // this squared is the number of training calls (set to 10)
-    pfloat loss = -1.0f;
-    uchar* weight_state = 0;
-    pfloat best_loss = FLT_MAX;
-    uchar* best_weight_state = (uchar*)malloc(weight_state_bytes);
-    for (int i=0; i<n_sweeps; i++) {
-	for (int j=0; j<n_sweeps; j++) {
-	    int ret = gpt2_eval(&loss,block_hash,cp,cp_bytes,depth,n_active_weights,rng_seed_offset+i,rng_seed_offset+j);
-	    printf("main() seed = (%u,%u) loss = %f\n",rng_seed_offset+i,rng_seed_offset+j,loss.convert_to<float>());
-	}
-    }
-    /*    cpf = fopen(cpfname,"ab");
+    const char* cpfname = "btm-cp.bin"; // chain file name
+    FILE* cpf = fopen(cpfname, "rb");
     if (!cpf) {
-	printf("error opening file %s for writing\n",cpfname);
-	exit(1);
+        printf("error: cannot open %s\n", cpfname);
+        exit(1);
     }
-    else {	
-	printf("weight_state =");
-	for (int i=0; i<64*8+40; i++) {
-	    printf(" %u",best_weight_state[i]);
-	}
-	printf(" ...\n");
+    fseekCheck(cpf, 0L, SEEK_END);
+    size_t cp_bytes = (size_t)ftell(cpf);
+    fseekCheck(cpf, 0L, SEEK_SET);
+    uchar* cp = (uchar*)mallocCheck(cp_bytes);
+    freadCheck(cp, 1, cp_bytes, cpf);
+    fcloseCheck(cpf);
+    printf("cp_bytes = %zu\n", cp_bytes);
 
-	size_t ret = fwrite(best_weight_state,1,weight_state_bytes,cpf);
-	printf("wrote %lu bytes to file %s\n",ret,cpfname);
-	fclose(cpf);
-	}*/
-    if (best_weight_state) free(best_weight_state);
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    float loss = -1.0f;
+    int ret = gpt2_eval(&loss, block_hash, cp, cp_bytes, depth);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    printf("eval took %.3f s (loss %f)\n", time_elapsed_s, loss);
+
+    free(cp);
     if (block_hash) free(block_hash);
-    return 0;
+    return ret;
 }
-#endif

@@ -40,4 +40,8 @@ dev/cuda/global_norm
 
 # btm chain state
 btm-cp.bin
+
+# btm f32 verifier binaries
+eval_gpt2_btm_f32
+eval_gpt2_btm_f32.wasm
 *~

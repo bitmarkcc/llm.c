@@ -243,7 +243,7 @@ endif
 .PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu profile_gpt2cu
 
 # Add targets
-TARGETS = train_gpt2 test_gpt2 train_gpt2_btm test2 eval_gpt2_btm
+TARGETS = train_gpt2 test_gpt2 train_gpt2_btm test2 eval_gpt2_btm eval_gpt2_btm_f32 eval_gpt2_btm_f32.wasm
 
 # Conditional inclusion of CUDA targets
 ifeq ($(NVCC),)
@@ -265,6 +265,21 @@ train_gpt2_btm: train_gpt2_btm.c
 
 eval_gpt2_btm: eval_gpt2_btm.c
 	$(CXX) $(CFLAGS) -DLLMC_PFLOAT $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) -lmimalloc -lcrypto -lmpfr $(OUTPUT_FILE)
+
+# ----------------------------------------------------------------------------
+# deterministic float verifier (native + wasm32-wasi), see doc/btm-proof-of-useful-work.md
+# strict IEEE float semantics: -O2 only, never -Ofast/-ffast-math/-march=native --
+# determinism is the whole point. The wasm toolchain paths can be overridden, e.g.
+#   make eval_gpt2_btm_f32.wasm WASI_CLANG=clang WASI_SYSROOT=/opt/wasi/sysroot
+WASI_CLANG ?= /usr/lib/llvm/21/bin/clang
+WASI_SYSROOT ?= $(HOME)/.local/share/wasi/sysroot
+WASI_BUILTINS ?= $(HOME)/.local/share/wasi/lib/wasi/libclang_rt.builtins-wasm32.a
+
+eval_gpt2_btm_f32: eval_gpt2_btm_f32.c
+	$(CC) -O2 $(INCLUDES) $^ -lm $(OUTPUT_FILE)
+
+eval_gpt2_btm_f32.wasm: eval_gpt2_btm_f32.c
+	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 $^ -o $@ -nodefaultlibs -lc $(WASI_BUILTINS)
 
 test_gpt2: test_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)

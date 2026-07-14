@@ -742,6 +742,13 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
+// Build the miner's starting model. Two independent seeds with distinct roles:
+//   rng_seed_1 picks WHICH n_active_weights parameter indices this attempt will train;
+//   rng_seed_2 draws their random initial values (GPT-2 style normal init).
+// All other weights start at 0 (layernorm params at 1), then the chain records in cp are
+// applied on top -- each attempt trains on top of the network accumulated so far.
+// The seeds are the miner's free choice and are NOT consensus-relevant: the published
+// record stores explicit (index,value) pairs, so verifiers never replay this init.
 void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, unsigned int rng_seed_1, unsigned int rng_seed_2, uchar* cp, size_t cp_bytes) {
     // init random (training from scratch)
 
@@ -1242,6 +1249,12 @@ int sample_mult(float* probabilities, int n, float coin) {
 // ----------------------------------------------------------------------------
 // main training loop
 //int main(int argc, char** argv) {
+// One mining attempt: build a model (fresh random subset of active weights per the
+// seeds, on top of the chain state in cp), train it for n_steps in fast native float,
+// then commit: hash the trained weights and score them on the hash-selected val batch.
+// Returns the (float) val loss and the weight_state buffer ready to append to the chain.
+// Note the float loss here is only the miner's guide for picking its best attempt; the
+// canonical score of the published record is computed by the verifier (eval_gpt2_btm).
 int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* cp, size_t cp_bytes, int depth, size_t n_active_weights, unsigned int rng_seed_1, unsigned int rng_seed_2) {
 
     GPT2 model;
@@ -1281,7 +1294,13 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
     }
 
     size_t weight_state_size = model.n_active_weights*8+32+8;
-    // <block_hash><weightIndex1><weightValue1>...<weightIndexN><weightValueN>
+    // weight_state layout: <32B block_hash><8B count><count x (uint32 index, float32 value)>
+    // Lifecycle: the head starts as the previous block hash (the chain tip's hash, or the
+    // Bitmark block hash passed on the command line for a fresh chain). After training,
+    // the trained weights are filled in and the whole buffer is double-SHA256 hashed; that
+    // hash both seeds the val batch selection below and then REPLACES the head before the
+    // buffer is appended to btm-cp.bin. So each record on disk starts with its own chained
+    // hash, which the next round picks up as its block hash.
     uchar* weight_state = malloc(weight_state_size);
     if (block_hash) {
 	memcpy(weight_state,block_hash,32);
@@ -1299,7 +1318,8 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
         // once in a while estimate the validation loss
         if (step == n_steps) {
 
-	    // hash the active weights
+	    // commit to the trained weights: copy their exact float bit patterns into
+	    // weight_state and compute the chained hash SHA256d(prev_hash || count || weights)
 	    unsigned int hash [8]; // hash is 256 bit = 8*32 bit
 	    unsigned int hash2 [8];
 	    for (int i=0; i<model.n_active_weights; i++) {
@@ -1324,6 +1344,9 @@ int gpt2_train(float* ploss, uchar** p_weight_state, uchar* block_hash, uchar* c
 		printf(" %u",((uchar*)hash2)[i]);
 	    printf("\n");
 	    memcpy(weight_state,hash2,32); // use this hash for the next 'block hash'
+	    // the hash selects the val batch (commit-then-evaluate): since the weights are
+	    // inside the hash preimage, the miner cannot know which batch it will be scored
+	    // on until its weights are already fixed -- no overfitting a known batch.
 	    // set seed to first 4 bytes of hash (todo: use full 32 bytes)
 	    manual_seed(&(val_loader.shuffle_rng),*hash2);
 	  
@@ -1464,10 +1487,15 @@ int main(int argc, char** argv) {
 	int ret = fread(cp,1,cp_bytes,cpf);
 	fclose(cpf);
     }
+    // If a chain file exists, continue the chain: walk record by record to the last one
+    // (each record is 40+8N bytes where N is its own count field, so we can't seek
+    // directly) and take the 32 bytes at its head -- its chained hash -- as our block
+    // hash. This OVERRIDES any command-line hash: the argument only anchors record #1
+    // of a fresh chain.
     size_t bytes_scanned = 0; /* Get prev block hash from cp file */
     while (bytes_scanned<cp_bytes) {
 	size_t n_cp_weights = *((size_t*)(cp+bytes_scanned+32));
-	if (bytes_scanned+40+n_cp_weights*8 == cp_bytes) {
+	if (bytes_scanned+40+n_cp_weights*8 == cp_bytes) { // record ends at EOF: it's the last one
 	    block_hash = malloc(32);
 	    memcpy(block_hash,cp+bytes_scanned,32);
 	    break;
@@ -1475,6 +1503,9 @@ int main(int argc, char** argv) {
 	bytes_scanned += 40+n_cp_weights*8;
     }
     
+    // The mining loop: try n_sweeps^2 (seed_1,seed_2) combinations -- each trains a
+    // different random subset of weights from different random inits -- and keep the
+    // attempt with the lowest val loss. Only the winner is appended to the chain file.
     int n_sweeps = 8; // this squared is the number of training calls
     float loss = -1.0f;
     uchar* weight_state = 0;
