@@ -148,23 +148,23 @@ unsigned int randint32(mt19937_state* state) {
     return y;
 }
 
-inline unsigned long long randint64(mt19937_state* state) {
+static inline unsigned long long randint64(mt19937_state* state) {
     return (((unsigned long long)(randint32(state)) << 32) | randint32(state));
 }
 
-inline float randfloat32(mt19937_state* state) { // this is in [0,1) ?
+static inline float randfloat32(mt19937_state* state) { // this is in [0,1) ?
     return (randint32(state) & ((1ull << 24) - 1)) * (1.0f / (1ull << 24));
 }
 #ifdef LLMC_PFLOAT
-inline pfloat randpfloat32(mt19937_state* state) {
+static inline pfloat randpfloat32(mt19937_state* state) {
     return (randint32(state) & ((1ull << 24) - 1)) * (pfloat(1) / (1ull << 24));
 }
 #endif
-inline double randfloat64(mt19937_state* state) {
+static inline double randfloat64(mt19937_state* state) {
     return (randint64(state) & ((1ull << 53) - 1)) * (1.0 / (1ull << 53));
 }
 #ifdef LLMC_PFLOAT
-inline pdouble randpfloat64(mt19937_state* state) {
+static inline pdouble randpfloat64(mt19937_state* state) {
     return (randint64(state) & ((1ull << 53) - 1)) * (pdouble(1) / (1ull << 53));
 }
 #endif
