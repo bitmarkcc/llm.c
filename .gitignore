@@ -45,3 +45,7 @@ btm-cp.bin
 eval_gpt2_btm_f32
 eval_gpt2_btm_f32.wasm
 *~
+btm-cp2.bin
+train_gpt2_btm2
+eval_gpt2_btm2_f32
+eval_gpt2_btm2_f32.wasm

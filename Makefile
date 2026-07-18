@@ -243,7 +243,7 @@ endif
 .PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu profile_gpt2cu
 
 # Add targets
-TARGETS = train_gpt2 test_gpt2 train_gpt2_btm test2 eval_gpt2_btm eval_gpt2_btm_f32 eval_gpt2_btm_f32.wasm
+TARGETS = train_gpt2 test_gpt2 train_gpt2_btm test2 eval_gpt2_btm eval_gpt2_btm_f32 train_gpt2_btm2 eval_gpt2_btm2_f32 eval_gpt2_btm_f32.wasm
 
 # Conditional inclusion of CUDA targets
 ifeq ($(NVCC),)
@@ -279,6 +279,16 @@ eval_gpt2_btm_f32: eval_gpt2_btm_f32.c
 	$(CC) -O2 $(INCLUDES) $^ -lm $(OUTPUT_FILE)
 
 eval_gpt2_btm_f32.wasm: eval_gpt2_btm_f32.c
+	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 $^ -o $@ -nodefaultlibs -lc $(WASI_BUILTINS)
+
+# v2: LoRA structured-delta miner + verifier (llmc/btmrecord.h format)
+train_gpt2_btm2: train_gpt2_btm2.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
+
+eval_gpt2_btm2_f32: eval_gpt2_btm2_f32.c
+	$(CC) -O2 $(INCLUDES) $^ -lm $(OUTPUT_FILE)
+
+eval_gpt2_btm2_f32.wasm: eval_gpt2_btm2_f32.c
 	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 $^ -o $@ -nodefaultlibs -lc $(WASI_BUILTINS)
 
 test_gpt2: test_gpt2.c
