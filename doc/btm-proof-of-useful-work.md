@@ -406,9 +406,41 @@ Implementation ladder step (a) COMPLETE on the 124M demonstrator:
   wasm/clang build); miner grad-projection loops are single-threaded (known
   speedup TODO: OMP pragmas).
 
-Next ladder steps: (b) toy MoE (depth 6, E=4, k=1: upcycling epoch, router
-tie-break determinism, expert-aware records); (c) the settled trunk config
+Next ladder steps: (b) toy MoE [DONE, below]; (c) the settled trunk config
 (C=768, V=16384, fine experts H=C/2, k=4, E~300/layer) + SIMD128 kernel.
+
+## Toy MoE: ladder step (b) COMPLETE (2026-07-19)
+
+Depth 6 (C=384), E=4 experts/layer, k=2, jumbo experts (H=4C) via upcycling.
+k=2 (not 1) deliberately: renormalized top-k softmax gating keeps the upcycle
+EXACTLY function-preserving (identical expert copies at gates 1/2+1/2 sum to
+the dense FFN) while still giving the router gradients (k=1 renormalized would
+freeze it at gate=1.0).
+
+- `llmc/btmmoe.h`: MoE 18-tensor layout (expert FFNs L*E*..., routerw L*E*C,
+  routerb L*E); deterministic upcycle (replicate dense FFN into E experts,
+  zero router); CONSENSUS top-k rule: ascending-index scan, strictly-greater
+  wins => equal logits keep the LOWER expert index (unit-tested); gates =
+  softmax over the selected k only. New record entry types: delta_type 2 =
+  LoRA int8 on ONE expert's matrix (u16 expert_id in payload -- scales to the
+  trunk's hundreds of experts), delta_type 3 = dense f32 slice overwrite
+  (routers). Walk/apply handles all 4 types.
+- `train_gpt2_btm_moe.c`: MoE forward (per-token routing, gate-weighted
+  expert FFNs, OMP over tokens) + backward (serial over tokens -- expert
+  weight-grad accumulation would race; through gates, softmax, router, and
+  both selected experts). Build = dense fixed-seed base -> upcycle -> apply
+  btm-cp-moe.bin. LoRA factors on attention + all E experts' matrices;
+  routers trained directly, committed dense. Chain file btm-cp-moe.bin.
+- `eval_gpt2_btm_moe_f32.c` (+ .wasm): same build path, forward-only.
+- Results: upcycle preservation VERIFIED (dense and upcycled-MoE step-0 loss
+  both 10.842146 on the identical batch); mined block anchored to the same
+  Bitmark hash: record 461,698 bytes (72 LoRA + 12 router entries), train
+  loss 10.84 -> 10.03 through routed experts, miner best_loss 10.032036 ==
+  native == wasm verifier loss, bits 41208338, outputs byte-identical except
+  timing (~9.6 s native / ~13.2 s wasm at depth 6).
+
+All three chains (v1, v2, MoE) now coexist: btm-cp.bin / btm-cp2.bin /
+btm-cp-moe.bin with their own program pairs.
 
 ## Open ends / next steps
 

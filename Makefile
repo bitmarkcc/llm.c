@@ -291,6 +291,16 @@ eval_gpt2_btm2_f32: eval_gpt2_btm2_f32.c
 eval_gpt2_btm2_f32.wasm: eval_gpt2_btm2_f32.c
 	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 $^ -o $@ -nodefaultlibs -lc $(WASI_BUILTINS)
 
+# toy MoE: E=4 experts, k=2, depth 6 (llmc/btmmoe.h)
+train_gpt2_btm_moe: train_gpt2_btm_moe.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
+
+eval_gpt2_btm_moe_f32: eval_gpt2_btm_moe_f32.c
+	$(CC) -O2 $(INCLUDES) $^ -lm $(OUTPUT_FILE)
+
+eval_gpt2_btm_moe_f32.wasm: eval_gpt2_btm_moe_f32.c
+	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 $^ -o $@ -nodefaultlibs -lc $(WASI_BUILTINS)
+
 test_gpt2: test_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
 
