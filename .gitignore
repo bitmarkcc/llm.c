@@ -53,3 +53,10 @@ btm-cp-moe.bin
 train_gpt2_btm_moe
 eval_gpt2_btm_moe_f32
 eval_gpt2_btm_moe_f32.wasm
+btm-cp-trunk.bin
+train_gpt2_btm_trunk
+eval_gpt2_btm_trunk_f32
+eval_gpt2_btm_trunk_f32.wasm
+eval_gpt2_btm_trunk_f32_simd.wasm
+btm-trunk-state.bin
+btm-cp-trunk-e100.bin

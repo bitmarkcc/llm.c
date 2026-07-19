@@ -289,10 +289,18 @@ GaLore). r, alpha, precision are per-epoch consensus parameters.
   (10-30B total, months-to-a-year of transport; its job is shared substrate,
   not capacity) and reach 1T AGGREGATE via the domain-chain federation --
   parallel chains = parallel pipes is the native bandwidth-scaling mechanism.
-  **Target trunk config (settled 2026-07-18):** C=768, L=12, NH=12, maxT=1024,
-  V=16384 byte-level BPE; fine-grained MoE: experts H=C/2 (0.59M params), k=4,
-  E~300/layer => ~69M active, ~2.2B total (32:1 sparsity, deliberately within
-  proven MoE practice). Val batch 64 tokens. Verification ~2.7 s scalar wasm,
+  **Target trunk config (settled 2026-07-18, revised 2026-07-19):** C=768,
+  L=12, NH=12, maxT=1024, V=16384 byte-level BPE; fine-grained MoE: experts
+  H=C/2 (0.59M params), k=4, **E=64/layer => ~69M active, ~496M total
+  (~7:1)**. E=64 chosen deliberately: ~2 GB of parameters per verifier
+  instance is the consensus-facing resource bound (8-way parallel block
+  verification in 16 GB -- commodity node RAM), and it sits under wasm32
+  dlmalloc's 2 GB single-allocation ceiling (discovered empirically: the 4 GB
+  address space is not the binding limit; a single params buffer >= 2 GB is).
+  Growth beyond E=64 (toward the original 32:1 / 2.2B ambition) is a later
+  epoch gated on per-tensor allocation (to ~130 experts), then memory64 or
+  lazy expert loading -- and raises node RAM requirements, a governance
+  decision, not a code change. Val batch 64 tokens. Verification ~2.7 s scalar wasm,
   ~0.7 s with the SIMD128 kernel (kernel required for the <1 s target).
   Delta scheme: r=4 int8 factors + per-factor fp16 scales, typed records,
   rotating per-block coverage (~25-30 experts' factors per block). Fully
@@ -441,6 +449,58 @@ freeze it at gate=1.0).
 
 All three chains (v1, v2, MoE) now coexist: btm-cp.bin / btm-cp2.bin /
 btm-cp-moe.bin with their own program pairs.
+
+## Trunk: ladder step (c) COMPLETE at E=64 (2026-07-19)
+
+The settled trunk config, built and validated end to end:
+C=768, L=12, V=16384 (custom byte-level BPE, `dev/data/tinyshakespeare16k.py`;
+corpus supports 12,712 of 16,384 ids -- unused rows are padding-like), fine
+experts H=384, k=4, E=64 => ~69M active / ~496M total, val = 64 tokens (B=1),
+chain `btm-cp-trunk.bin`, files `train_gpt2_btm_trunk.c` /
+`eval_gpt2_btm_trunk_f32.c` (+ .wasm, + _simd.wasm).
+
+- **Base init**: `btmmoe_init_base_params` -- fixed-seed random MoE init
+  (distinct random experts; SMALL RANDOM router, since a zero router would
+  tie all logits and permanently strand experts k..E-1). No dense pre-phase
+  at genesis (function preservation is an epoch-transition concern, not a
+  genesis concern).
+- **Rotating coverage**: each block commits LoRA factors for attention (qkvw,
+  attprojw), the router matrix (type-1 LoRA on tensor 16, dims (E,C)), and 3
+  seed-chosen experts per layer (delta type 2). 108 entries, 594,082 bytes.
+- **Canonical kernel** (`llmc/btmkernel.h`): dot products with FOUR partial
+  accumulators (lane j takes elements i+j), fixed reduction (a0+a1)+(a2+a3);
+  the wasm SIMD128 intrinsics path computes the same lanes per-lane-IEEE =>
+  bit-identical to the portable path. This 4-acc order IS the trunk's
+  canonical arithmetic (consensus pins the module; no parity with older
+  chains required). Used by miner and verifier forward passes, so miner
+  loss == canonical loss exactly.
+- **Results**: mined anchored to the same Bitmark hash; train loss 9.73
+  (~ln 16384) -> 7.8 in 30 steps; native / wasm / wasm+SIMD outputs
+  BIT-IDENTICAL, loss 8.544360 (== miner), bits 4108b5b3. Forward pass:
+  native 2.16 s, wasm scalar 7.38 s, wasm+SIMD 2.37 s (3.1x, near-native).
+  Total eval 20-32 s, now dominated by MODEL BUILD (~18-25 s: ~460M
+  Box-Muller draws + record apply), not the forward pass.
+- **wasm32 limit, empirically**: dlmalloc rejects single allocations >= 2 GB
+  (the 4 GB address space is not the binding limit). E=100 (3 GB params)
+  verified native-only; E=64 (1.76 GB) is the wasm32-safe config and the
+  SETTLED one (2 GB/verifier instance, 8-way parallel in 16 GB node RAM).
+- **Weight-state caching (2026-07-19, `llmc/btmcache.h`): DONE.** Node-side,
+  explicitly NOT consensus (memoization of the canonical build; rebuild from
+  genesis must and does produce identical bits). File = <32B tip (head of
+  last folded record; 0xEE*32 genesis sentinel)><raw f32 params>; on build,
+  a tip matching a chain record head resumes from there. Warm verification:
+  **3.6 s** (1.1 s state load + ~2.4 s forward), native and wasm+SIMD alike,
+  same loss bits; cache files are cross-runtime compatible. Implementation
+  hard-lessons baked in: chunked 64 MB I/O (wasi returns short counts on
+  multi-GB transfers) and write-to-temp+rename (first attempt truncated a
+  valid cache on a failed save). k stays 4 (k tracks expert SIZE, not E:
+  fine H=384 experts at k=4 give 1536 active FFN width, already half of
+  dense GPT-2; k=2 would quarter it -- rejected).
+  Remaining to ~1 s: resident state in an embedded node (drops the 1.1 s
+  load => ~2.4 s now) + wider-accumulator canonical kernel (~2x forward =>
+  ~1.2-1.5 s). Lazy expert loading noted as irrelevant at E=64 (a 64-token
+  x k=4 val batch touches nearly all 64 experts; it pays only when
+  E >> tokens*k).
 
 ## Open ends / next steps
 

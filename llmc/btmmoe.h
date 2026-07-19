@@ -255,3 +255,184 @@ static inline int btmmoe_apply_record(float* params, const unsigned char* rec, s
 }
 
 #endif // BTMMOE_H
+
+// ============================================================================
+// Trunk extensions: expert hidden width H as a parameter, router LoRA, and a
+// direct fixed-seed MoE base init (no dense pre-phase / upcycle at genesis).
+// Additive API -- the toy (H = 4C) continues to use the functions above.
+
+// 18 tensor sizes with explicit expert hidden width H
+static inline void btmmoe_fill_param_sizes_h(size_t* param_sizes, int Vp, int maxT,
+                                             int L, int C, int E, int H) {
+    param_sizes[0]  = (size_t)Vp * C;
+    param_sizes[1]  = (size_t)maxT * C;
+    param_sizes[2]  = (size_t)L * C;
+    param_sizes[3]  = (size_t)L * C;
+    param_sizes[4]  = (size_t)L * 3*C * C;
+    param_sizes[5]  = (size_t)L * 3*C;
+    param_sizes[6]  = (size_t)L * C * C;
+    param_sizes[7]  = (size_t)L * C;
+    param_sizes[8]  = (size_t)L * C;
+    param_sizes[9]  = (size_t)L * C;
+    param_sizes[10] = (size_t)L * E * H * C;   // expert fcw (H, C) each
+    param_sizes[11] = (size_t)L * E * H;
+    param_sizes[12] = (size_t)L * E * C * H;   // expert fcprojw (C, H) each
+    param_sizes[13] = (size_t)L * E * C;
+    param_sizes[14] = (size_t)C;
+    param_sizes[15] = (size_t)C;
+    param_sizes[16] = (size_t)L * E * C;       // routerw (E, C) per layer
+    param_sizes[17] = (size_t)L * E;           // routerb
+}
+
+static inline void btmmoe_expert_dims_h(int type, int C, int H, int* out, int* in) {
+    if (type == 10) { *out = H; *in = C; }
+    else            { *out = C; *in = H; } // type 12
+}
+
+static inline size_t btmmoe_expert_matrix_offset_h(int type, int layer, int expert,
+                                                   int C, int H, int E, const size_t* tensor_offsets) {
+    size_t mat = (size_t)H * C;
+    return tensor_offsets[type] + ((size_t)layer * E + expert) * mat;
+}
+
+// LoRA dims for dense-LoRA (delta_type 1) tensors in trunk models: attention
+// matrices plus the router matrix (type 16, (E, C) per layer slice)
+static inline int btmmoe_lora_dims_r(int type, int C, int E, int* out, int* in) {
+    if      (type == 4)  { *out = 3*C; *in = C; }
+    else if (type == 6)  { *out = C;   *in = C; }
+    else if (type == 16) { *out = E;   *in = C; }
+    else return -1;
+    return 0;
+}
+
+static inline size_t btmmoe_entry_size_h(const unsigned char* e, size_t max_bytes, int C, int H, int E) {
+    if (max_bytes < 4) return 0;
+    int type = e[0];
+    int dtype = e[2];
+    int r = e[3];
+    if (dtype == BTM2_DELTA_LORA_INT8) {
+        int out, in;
+        if (btmmoe_lora_dims_r(type, C, E, &out, &in) != 0) return 0;
+        if (r <= 0) return 0;
+        return 4 + 4 + (size_t)out * r + (size_t)r * in;
+    }
+    if (dtype == BTM2_DELTA_LORA_EXPERT) {
+        int out, in;
+        if (!(type == 10 || type == 12)) return 0;
+        if (r <= 0) return 0;
+        btmmoe_expert_dims_h(type, C, H, &out, &in);
+        return 4 + 8 + (size_t)out * r + (size_t)r * in;
+    }
+    if (dtype == BTM2_DELTA_DENSE || dtype == BTM2_DELTA_SPARSE) {
+        if (max_bytes < 8) return 0;
+        uint32_t n;
+        memcpy(&n, e + 4, 4);
+        return 8 + (size_t)n * (dtype == BTM2_DELTA_DENSE ? 4 : 8);
+    }
+    return 0;
+}
+
+static inline size_t btmmoe_record_size_h(const unsigned char* rec, size_t max_bytes, int C, int H, int E) {
+    if (max_bytes < BTM2_HEADER_BYTES) return 0;
+    uint16_t n_entries;
+    memcpy(&n_entries, rec + 32, 2);
+    size_t off = BTM2_HEADER_BYTES;
+    for (uint16_t i = 0; i < n_entries; i++) {
+        size_t esz = btmmoe_entry_size_h(rec + off, max_bytes - off, C, H, E);
+        if (esz == 0 || off + esz > max_bytes) return 0;
+        off += esz;
+    }
+    return off;
+}
+
+static inline int btmmoe_apply_record_h(float* params, const unsigned char* rec, size_t rec_bytes,
+                                        int L, int C, int E, int H,
+                                        const size_t* param_sizes, const size_t* tensor_offsets) {
+    uint16_t n_entries;
+    memcpy(&n_entries, rec + 32, 2);
+    const unsigned char* e = rec + BTM2_HEADER_BYTES;
+    size_t left = rec_bytes - BTM2_HEADER_BYTES;
+    for (uint16_t i = 0; i < n_entries; i++) {
+        size_t esz = btmmoe_entry_size_h(e, left, C, H, E);
+        if (esz == 0 || esz > left) return -1;
+        int type = e[0];
+        int layer = e[1];
+        int dtype = e[2];
+        int r = e[3];
+        if (dtype == BTM2_DELTA_LORA_INT8) {
+            int out, in;
+            btmmoe_lora_dims_r(type, C, E, &out, &in);
+            uint16_t sA, sB;
+            memcpy(&sA, e + 4, 2);
+            memcpy(&sB, e + 6, 2);
+            const int8_t* A = (const int8_t*)(e + 8);
+            const int8_t* B = A + (size_t)out * r;
+            size_t slice = param_sizes[type] / (size_t)L;
+            btm2_apply_lora_int8(params + tensor_offsets[type] + (size_t)layer * slice,
+                                 out, in, r, A, B, sA, sB);
+        } else if (dtype == BTM2_DELTA_LORA_EXPERT) {
+            int out, in;
+            btmmoe_expert_dims_h(type, C, H, &out, &in);
+            uint16_t expert_id, sA, sB;
+            memcpy(&expert_id, e + 4, 2);
+            memcpy(&sA, e + 8, 2);
+            memcpy(&sB, e + 10, 2);
+            if ((int)expert_id >= E) return -1;
+            const int8_t* A = (const int8_t*)(e + 12);
+            const int8_t* B = A + (size_t)out * r;
+            btm2_apply_lora_int8(params + btmmoe_expert_matrix_offset_h(type, layer, expert_id, C, H, E, tensor_offsets),
+                                 out, in, r, A, B, sA, sB);
+        } else if (dtype == BTM2_DELTA_DENSE) {
+            uint32_t numel;
+            memcpy(&numel, e + 4, 4);
+            size_t slice = param_sizes[type] / (size_t)L;
+            if (type < 2 || type == 14 || type == 15) slice = param_sizes[type];
+            if ((size_t)numel != slice) return -1;
+            memcpy(params + tensor_offsets[type] + (size_t)layer * slice, e + 8, (size_t)numel * 4);
+        } else {
+            uint32_t count;
+            memcpy(&count, e + 4, 4);
+            size_t slice = param_sizes[type] / (size_t)L;
+            if (type < 2 || type == 14 || type == 15) slice = param_sizes[type];
+            size_t base = tensor_offsets[type] + (size_t)layer * slice;
+            for (uint32_t j = 0; j < count; j++) {
+                uint32_t idx; float val;
+                memcpy(&idx, e + 8 + (size_t)j * 8, 4);
+                memcpy(&val, e + 8 + (size_t)j * 8 + 4, 4);
+                if (idx < slice) params[base + idx] = val;
+            }
+        }
+        e += esz;
+        left -= esz;
+    }
+    return 0;
+}
+
+// Fixed-seed random MoE base init (CONSENSUS for trunk chains; genesis needs no
+// function preservation). Distinct random init per expert; SMALL RANDOM router
+// (a zero router would tie all logits and permanently strand experts k..E-1).
+// Draw order: single rng; whole tensors in index order 0,1,4,6,10,12,16;
+// residual-scaled (1/sqrt(2L)) for attproj and expert fcproj; biases zero;
+// layernorm scales one. params must be zeroed by the caller.
+static inline void btmmoe_init_base_params(float* params, const size_t* param_sizes,
+                                           const size_t* tensor_offsets,
+                                           int L, int C, int V, int E, int H, unsigned int seed) {
+    (void)E; (void)H;
+    float rs = 1.0f / sqrtf(2.0f * (float)L);
+    mt19937_state rng;
+    manual_seed(&rng, seed);
+    for (size_t j = 0; j < param_sizes[2]; j++)  params[tensor_offsets[2] + j] = 1.0f;  // ln1w
+    for (size_t j = 0; j < param_sizes[8]; j++)  params[tensor_offsets[8] + j] = 1.0f;  // ln2w
+    for (size_t j = 0; j < param_sizes[14]; j++) params[tensor_offsets[14] + j] = 1.0f; // lnfw
+    const int order[7] = {0, 1, 4, 6, 10, 12, 16};
+    for (int oi = 0; oi < 7; oi++) {
+        int t = order[oi];
+        size_t n = param_sizes[t];
+        if (t == 0) n = (size_t)V * C; // init V rows of wte, not Vp
+        float scale = (t == 6 || t == 12) ? 0.02f * rs : 0.02f;
+        float* buf = (float*)malloc(n * sizeof(float));
+        normal_(buf, (unsigned int)n, 0.0f, scale, &rng);
+        memcpy(params + tensor_offsets[t], buf, n * sizeof(float));
+        free(buf);
+    }
+}

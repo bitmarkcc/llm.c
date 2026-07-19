@@ -301,6 +301,19 @@ eval_gpt2_btm_moe_f32: eval_gpt2_btm_moe_f32.c
 eval_gpt2_btm_moe_f32.wasm: eval_gpt2_btm_moe_f32.c
 	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 $^ -o $@ -nodefaultlibs -lc $(WASI_BUILTINS)
 
+# trunk: C=768, V=16384, fine experts H=384, k=4, E=100 (wasm32-safe; E~300 needs memory64)
+train_gpt2_btm_trunk: train_gpt2_btm_trunk.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
+
+eval_gpt2_btm_trunk_f32: eval_gpt2_btm_trunk_f32.c
+	$(CC) -O2 $(INCLUDES) $^ -lm $(OUTPUT_FILE)
+
+eval_gpt2_btm_trunk_f32.wasm: eval_gpt2_btm_trunk_f32.c
+	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 $^ -o $@ -nodefaultlibs -lc $(WASI_BUILTINS)
+
+eval_gpt2_btm_trunk_f32_simd.wasm: eval_gpt2_btm_trunk_f32.c
+	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 -msimd128 $^ -o $@ -nodefaultlibs -lc $(WASI_BUILTINS)
+
 test_gpt2: test_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
 
