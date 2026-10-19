@@ -6,11 +6,14 @@
 *.bin
 
 # data directories
+dev/__pycache__/
 dev/data/__pycache__/
+dev/data/edu_fineweb10B/
 dev/data/fineweb10B/
 dev/data/hellaswag/
 dev/data/mmlu/
 dev/data/tinyshakespeare/
+dev/data/tinyshakespeare16k/
 dev/data/tinystories/
 
 # binaries
@@ -60,3 +63,10 @@ eval_gpt2_btm_trunk_f32.wasm
 eval_gpt2_btm_trunk_f32_simd.wasm
 btm-trunk-state.bin
 btm-cp-trunk-e100.bin
+
+# corpus commitment: generated from the corpus, regenerated per corpus. The consensus
+# constants live in llmc/btmcorpus_params.h, which IS tracked; this is the tool's
+# working output and the level-0 leaf-hash cache (5 GB at 10B tokens).
+corpus_root.json
+corpus_leaves.bin
+dev/btm_corpus_check
