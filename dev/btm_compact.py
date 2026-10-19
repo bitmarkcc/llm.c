@@ -14,15 +14,23 @@ This writes the files that answer it, to be scored by the real evaluator:
   zero.bin       ONE record whose every entry has a zero scale, so it applies NOTHING
                  and scores the bare fixed-seed base model
 
-Then, with the val batch pinned so all three are scored on the same 64 tokens:
+BLOCKED AS OF THE CORPUS COMMITMENT. This tool predates llmc/btmcorpus.h and does not yet
+work against the current verifier, for two independent reasons:
 
-    make eval_gpt2_btm_trunk_f32
-    for f in btm-cp-trunk.bin compacted.bin zero.bin; do
-        BTM_VAL_SEED=12345 ./eval_gpt2_btm_trunk_f32 ... # reads ./btm-cp-trunk.bin
-    done
+  * the synthetic records it writes carry no BTM2_DELTA_CORPUS_PROOF entry, so the
+    verifier reports "no valid solution: record carries no corpus proof" and never
+    scores them at all;
+  * the window is now a function of a record's own deltas, so even with proofs attached
+    the three files would be scored on three DIFFERENT 64-token windows. Window
+    difficulty varies by ~0.75 nats, which is far more than compaction is expected to
+    cost, so the comparison would measure the draw and not the compaction.
 
-(the evaluator hardcodes its input path, so swap the file in or pass --out to write
-compacted.bin over a copy -- see the runner printed at the end).
+The old BTM_VAL_SEED knob that pinned the window no longer exists -- there is no seed to
+set, the index is derived from the deltas. What this needs instead is a diagnostic
+BTM_WINDOW=<leaf_index> in the verifier (hosted-only, like BTM_CHAIN) that overrides the
+proof-derived window and reads that leaf off the corpus on disk, bypassing the proof
+checks. That makes all three files comparable on identical tokens, which is the only form
+in which `retained` below means anything.
 
 THE HEADLINE NUMBER is not the loss gap but the fraction of the records' useful work that
 survives compaction:
@@ -318,13 +326,15 @@ def main():
     print(f"  wrote {args.zero_out}: {len(zrec):,} bytes (applies nothing; scores the base)")
 
     print(f"""
-Now score all three on the SAME val batch, with BTM_CHAIN so nothing is moved:
+Score all three on the SAME window, with BTM_CHAIN so nothing is moved. This NEEDS the
+BTM_WINDOW knob described at the top of this file; without it the verifier rejects the
+synthetic records for carrying no corpus proof, and the run below reports nothing:
 
   for f in {args.chain} {args.out} {args.zero_out}; do
       rm -f btm-trunk-state.bin
       echo "== $f"
-      BTM_CHAIN=$f BTM_VAL_SEED=12345 ./eval_gpt2_btm_trunk_f32 2>&1 \\
-          | grep -E "val loss|cache|DIAGNOSTIC"
+      BTM_CHAIN=$f BTM_WINDOW=12345 ./eval_gpt2_btm_trunk_f32 2>&1 \\
+          | grep -E "val loss|cache|DIAGNOSTIC|no valid solution"
   done
 
 Then:  retained = (loss_base - loss_compacted) / (loss_base - loss_full)
@@ -332,8 +342,11 @@ Then:  retained = (loss_base - loss_compacted) / (loss_base - loss_full)
 Two things to verify in the output, or the comparison is void:
   * every run says "state cache miss: full rebuild" -- btm-trunk-state.bin is keyed on
     the last record's head, so a stale one makes a run report another run's loss;
-  * every run says "val batch pinned to seed 12345" -- otherwise each file's last
-    record picks its own 64 tokens and the losses are not comparable.
+  * every run reports the SAME leaf index -- otherwise each file was scored on its own
+    window and the losses are not comparable.
+
+Repeat over several BTM_WINDOW values: one 63-token window is far too noisy to carry a
+retention figure on its own.
 
 A "chained hash does NOT match" warning on the synthetic files is expected and cosmetic:
 nothing mined them, so their heads do not satisfy the real chaining rule.""")
