@@ -38,12 +38,25 @@ miner; the v2 logic starts at "v2 LoRA miner" near the end of the file.
 // defines: node-side weight-state cache (NOT consensus)
 #include "llmc/btmcache.h"
 
+// defines: corpus-commitment proof construction (miner half; hosted, uses stdio/malloc)
+#include "llmc/btmcorpus_build.h"
+#include "llmc/btmcorpus_params.h"
+
 // trunk configuration (consensus parameters of this chain)
-// E=100 => ~751M total params (~3 GB), the wasm32-safe prototype scale.
-// The settled 32:1 target (E~300, 2.2B, 8.8 GB) needs memory64 or lazy expert
+//
+// E=64 => 496,216,320 total params = 1.849 GiB in f32, which is what FITS the Bitmark
+// verifier's linear-memory cap of 32512 pages (1.984 GiB). The node measured this model
+// at 1.902 GiB with ~84 MiB headroom; see WASM_MAX_MEMORY_PAGES in
+// src/dynamicalgo/wasmexec.cpp. E=100 would be ~751M params (~2.8 GiB) and would NOT
+// load, so it was never the "wasm32-safe prototype scale" an earlier comment here
+// claimed. The settled 32:1 target (E~300, 2.2B, 8.8 GB) needs memory64 or lazy expert
 // loading -- see doc. All machinery below is E-agnostic.
+//
+// CONSENSUS-CRITICAL and must match eval_gpt2_btm_trunk_f32.c: E sizes the router entry
+// (out = E) and therefore the FRAMING of every record, so a miner and a verifier that
+// disagree cannot even walk the same chain file.
 #ifndef MOE_E
-#define MOE_E 100
+#define MOE_E 64
 #endif
 #define MOE_K 4   // active experts per token
 #define MOE_H 384 // expert hidden width (C/2): fine-grained experts
@@ -1586,6 +1599,30 @@ int gpt2_train_trunk(float* ploss, uchar** p_record, size_t* p_record_bytes,
     dataloader_init(&train_loader, train_tokens, B, T, 0, 1, 1);
     dataloader_init(&val_loader, train_tokens, 1, 64, 0, 1, 1); // val = 64 tokens
 
+    // Seed the TRAIN loader from the chain, not from the attempt.
+    //
+    // dataloader_init seeds shuffle_rng with the constant `42 + process_rank`
+    // (llmc/dataloader.h), so without this every record trains on the same permutation
+    // and therefore the same first B*T*n_steps tokens -- the chain re-fits one fixed
+    // slice forever and the corpus size is irrelevant, however large it is.
+    //
+    // Derived from block_hash rather than attempt_seed deliberately: every miner at a
+    // given height then trains on the SAME tokens, so attempts compete on the quality of
+    // the delta instead of on a lucky draw, and best-of-n stops selecting partly for
+    // which slice an attempt happened to get. It also makes the slice a function of the
+    // chain, which is the same property the val batch already has.
+    {
+        // Genesis only -- the very first record of a chain has no predecessor to key on.
+        // BTM2_BASE_SEED is reused rather than inventing a constant: it is already this
+        // chain's genesis seed (the fixed-seed base init), so the first record's data
+        // slice and the weights it trains against come from the same place.
+        unsigned int data_seed = BTM2_BASE_SEED;
+        if (block_hash) memcpy(&data_seed, block_hash, 4);
+        manual_seed(&(train_loader.shuffle_rng), data_seed);
+        dataloader_reset(&train_loader); // re-permute with the seed just set
+        printf("train data slice seeded from the chain (seed %u)\n", data_seed);
+    }
+
     float lr = 1e-3f, beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f;
     int n_steps = 30;
     for (int step = 0; step < n_steps; step++) {
@@ -1650,15 +1687,21 @@ int gpt2_train_trunk(float* ploss, uchar** p_record, size_t* p_record_bytes,
     }
 
     // commit: quantize factors, rematerialize the quantized deltas, build record
-    size_t rec_bytes = BTM2_HEADER_BYTES;
+    size_t delta_bytes = 0;
     for (int i = 0; i < n_mat; i++) {
         size_t hdr = mexpert[i] < 0 ? 8 : 12;
-        rec_bytes += hdr + (size_t)mout[i] * r + (size_t)r * min_[i];
+        delta_bytes += hdr + (size_t)mout[i] * r + (size_t)r * min_[i];
     }
+    // The corpus proof rides LAST, after every delta entry: the window index is derived
+    // from a prefix of this very buffer that ends where the proof begins, which is what
+    // keeps the index from depending on itself (llmc/btmcorpus.h).
+    const int proof_depth = btmc_depth(BTM_CORPUS_N_LEAVES);
+    const size_t proof_bytes = (size_t)BTM2_PROOF_FIXED_BYTES + (size_t)proof_depth * 32;
+    size_t rec_bytes = BTM2_HEADER_BYTES + delta_bytes + proof_bytes;
     uchar* rec = (uchar*)mallocCheck(rec_bytes);
     if (block_hash) memcpy(rec, block_hash, 32);
     else memset(rec, 255, 32);
-    uint16_t n_entries = (uint16_t)n_mat;
+    uint16_t n_entries = (uint16_t)(n_mat + 1);  // + the corpus proof
     memcpy(rec + 32, &n_entries, 2);
     uchar* e = rec + BTM2_HEADER_BYTES;
     for (int i = 0; i < n_mat; i++) {
@@ -1694,6 +1737,66 @@ int gpt2_train_trunk(float* ploss, uchar** p_record, size_t* p_record_bytes,
         e += (mexpert[i] < 0 ? 8 : 12) + (size_t)out * r + (size_t)r * in;
     }
 
+    // --- corpus proof -------------------------------------------------------------
+    // `rec` already holds prev_head in bytes 0..32 (the head is overwritten below), so it
+    // IS the chaining preimage and the index prefix is contiguous: everything up to where
+    // the proof entry starts.
+    const size_t prefix_len = BTM2_HEADER_BYTES + delta_bytes;
+    uint64_t leaf_index = btmc_leaf_index(rec, prefix_len, BTM_CORPUS_N_LEAVES);
+
+    uchar leaf[BTMC_LEAF_BYTES];
+    if (btmcb_read_leaf(train_tokens, leaf_index, leaf) != 0) {
+        printf("error: cannot read corpus leaf %llu from %s\n",
+               (unsigned long long)leaf_index, train_tokens);
+        exit(1);
+    }
+    // Level-0 hashes: from the cache dev/btm_corpus_root.py --save-leaves writes if it is
+    // there, else rehashed from the corpus. The cache matters at 10B tokens, where
+    // rehashing is minutes; at this scale either is instant.
+    uint64_t nl = 0;
+    uchar* leaves = btmcb_load_leaves("corpus_leaves.bin", &nl);
+    if (!leaves || nl != BTM_CORPUS_N_LEAVES) {
+        free(leaves);
+        leaves = btmcb_build_leaves(train_tokens, &nl);
+    }
+    if (!leaves || nl != BTM_CORPUS_N_LEAVES) {
+        printf("error: corpus has %llu leaves, BTM_CORPUS_N_LEAVES is %llu -- "
+               "re-run dev/btm_corpus_root.py --emit-header\n",
+               (unsigned long long)nl, (unsigned long long)BTM_CORPUS_N_LEAVES);
+        exit(1);
+    }
+    uchar sibs[BTMC_MAX_DEPTH * 32];
+    int n_sibs = 0;
+    if (btmcb_path(leaves, nl, leaf_index, sibs, &n_sibs) != 0) {
+        printf("error: cannot build a path for leaf %llu\n", (unsigned long long)leaf_index);
+        exit(1);
+    }
+    free(leaves);
+
+    // Self-check before publishing: fold our own proof with the VERIFIER's code and
+    // compare against the committed root. A miner that skips this publishes records every
+    // verifier rejects, and learns about it only from an empty wallet.
+    {
+        uchar want[32], got[32];
+        const char* hx = BTM_CORPUS_ROOT_HEX;
+        for (int i = 0; i < 32; i++) {
+            unsigned v; sscanf(hx + 2 * i, "%2x", &v); want[i] = (uchar)v;
+        }
+        int rc = btmc_fold(leaf_index, BTM_CORPUS_N_LEAVES, leaf, sibs, n_sibs, got);
+        if (rc != 0 || memcmp(got, want, 32) != 0) {
+            printf("error: own corpus proof does not fold to BTM_CORPUS_ROOT (rc=%d)\n", rc);
+            exit(1);
+        }
+    }
+    size_t wrote = btmcb_write_proof_entry(rec + prefix_len, leaf_index, leaf, sibs, n_sibs);
+    if (wrote != proof_bytes) {
+        printf("error: proof entry is %zu bytes, expected %zu\n", wrote, proof_bytes);
+        exit(1);
+    }
+    printf("corpus proof: leaf %llu of %llu, depth %d, %zu bytes\n",
+           (unsigned long long)leaf_index, (unsigned long long)BTM_CORPUS_N_LEAVES,
+           n_sibs, proof_bytes);
+
     uchar hash[32], hash2[32];
     sha256_hash(rec, rec_bytes, hash);
     sha256_hash(hash, 32, hash2);
@@ -1705,15 +1808,20 @@ int gpt2_train_trunk(float* ploss, uchar** p_record, size_t* p_record_bytes,
     // val on 64 tokens: acts were sized for the training B,T -- free for lazy realloc
     free(model.acts_memory);
     model.acts_memory = NULL;
-    unsigned int seed;
-    memcpy(&seed, hash2, 4);
-    manual_seed(&(val_loader.shuffle_rng), seed);
-    dataloader_reset(&val_loader);
-    dataloader_next_batch(&val_loader);
+    // Scored on the window the proof carries -- the same bytes a verifier will score,
+    // obtained the same way. No dataloader: the verifier has no corpus to load one from.
+    int vin[BTM_CORPUS_SCORE_T], vtar[BTM_CORPUS_SCORE_T];
+    for (int j = 0; j < BTM_CORPUS_SCORE_T; j++) {
+        uint16_t a, b;
+        memcpy(&a, leaf + 2 * j, 2);
+        memcpy(&b, leaf + 2 * (j + 1), 2);
+        vin[j] = (int)a;
+        vtar[j] = (int)b;   // next-token targets, so a 64-token leaf scores 63 predictions
+    }
     printf("inputs:");
-    for (int j = 0; j < 64; j++) printf(" %d", val_loader.inputs[j]);
+    for (int j = 0; j < BTM_CORPUS_SCORE_T; j++) printf(" %d", vin[j]);
     printf("\n");
-    gpt2_forward(&model, val_loader.inputs, val_loader.targets, 1, 64);
+    gpt2_forward(&model, vin, vtar, 1, BTM_CORPUS_SCORE_T);
     float val_loss = model.mean_loss;
     printf("attempt seed %u: val loss %f\n", attempt_seed, val_loss);
 
@@ -1726,6 +1834,59 @@ int gpt2_train_trunk(float* ploss, uchar** p_record, size_t* p_record_bytes,
     free(mtype); free(mlayer); free(mexpert); free(mout); free(min_);
     free(woff); free(aoff); free(boff); free(foff);
     free(fA); free(fB); free(dA); free(dB); free(fm); free(fv); free(wfrozen);
+    return 0;
+}
+
+
+//! Score a candidate record by running the verifier binary on (chain || candidate).
+//!
+//! WHY NOT SCORE IT HERE. The miner is built with $(CFLAGS) = -Ofast -march=native, the
+//! verifier with -O2 for strict IEEE semantics (see the Makefile). -Ofast licenses
+//! reassociation and FMA contraction, so the two disagree on the val loss by ~1e-6 --
+//! measured, not theoretical. Consensus only needs verifier-vs-verifier agreement, which
+//! holds, but a miner that cannot reproduce the verifier's number cannot tell whether its
+//! record clears a loss threshold near the margin. -march=native makes the miner's
+//! arithmetic machine-dependent too, so even two miners would disagree.
+//!
+//! So there is ONE implementation of scoring and the miner calls it. The cost is a
+//! subprocess and a fold per attempt; the verifier's state cache absorbs the base, and it
+//! deliberately does not write the cache under BTM_CHAIN, so candidates cannot poison it.
+//!
+//! Returns 0 and sets *ploss on success.
+static int btm_score_with_verifier(const uchar* cp, size_t cp_bytes,
+                                   const uchar* rec, size_t rec_bytes, float* ploss) {
+    const char* evalbin = getenv("BTM_EVAL");
+    if (!evalbin) evalbin = "./eval_gpt2_btm_trunk_f32";
+    const char* tmp = "btm-candidate-chain.bin";
+
+    FILE* f = fopen(tmp, "wb");
+    if (!f) { printf("score: cannot write %s\n", tmp); return -1; }
+    if (cp_bytes && fwrite(cp, 1, cp_bytes, f) != cp_bytes) { fclose(f); return -2; }
+    if (fwrite(rec, 1, rec_bytes, f) != rec_bytes) { fclose(f); return -3; }
+    fclose(f);
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "BTM_CHAIN=%s %s 2>&1", tmp, evalbin);
+    FILE* pp = popen(cmd, "r");
+    if (!pp) { printf("score: cannot run %s\n", evalbin); return -4; }
+    char line[4096];
+    int got = 0;
+    float loss = 0.0f;
+    while (fgets(line, sizeof(line), pp)) {
+        // The verifier prints "val loss %f"; take the LAST one in case a future version
+        // prints more than one.
+        const char* m = strstr(line, "val loss ");
+        if (m && sscanf(m + 9, "%f", &loss) == 1) got = 1;
+        if (strstr(line, "no valid solution")) {
+            printf("score: verifier rejects the candidate: %s", line);
+            pclose(pp);
+            return -5;
+        }
+    }
+    pclose(pp);
+    remove(tmp);
+    if (!got) { printf("score: no val loss in the verifier's output\n"); return -6; }
+    *ploss = loss;
     return 0;
 }
 
@@ -1787,7 +1948,19 @@ int main(int argc, char** argv) {
         uchar* rec = 0;
         size_t rec_bytes = 0;
         gpt2_train_trunk(&loss, &rec, &rec_bytes, block_hash, cp, cp_bytes, 12, seed_offset + (unsigned int)i);
-        printf("main() attempt seed %u: val loss %f\n", seed_offset + (unsigned int)i, loss);
+        // The number that decides anything is the VERIFIER's, so selection uses it. The
+        // miner's own forward pass above is kept only as an advisory figure; the gap
+        // between them is the -Ofast/-O2 float-semantics difference and is worth seeing.
+        float advisory = loss, vloss = 0.0f;
+        if (btm_score_with_verifier(cp, cp_bytes, rec, rec_bytes, &vloss) != 0) {
+            printf("main() attempt seed %u: could not be scored by the verifier; skipped\n",
+                   seed_offset + (unsigned int)i);
+            free(rec);
+            continue;
+        }
+        loss = vloss;
+        printf("main() attempt seed %u: verifier val loss %f (miner said %f, delta %+.3e)\n",
+               seed_offset + (unsigned int)i, vloss, advisory, (double)(advisory - vloss));
         if (loss < best_loss) {
             best_loss = loss;
             free(best_rec);

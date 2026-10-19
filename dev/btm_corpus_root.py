@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Build the Merkle commitment over a tokenised Bitmark trunk corpus.
+
+The verifier scores a record on a 64-token window of the corpus and has no filesystem,
+so a 10B-token corpus (20 GB) cannot live in the module. Instead the module holds a
+32-byte root, and each record carries its scored window plus a proof against that root.
+See llmc/btmcorpus.h for the layout and the reasoning -- this file MUST agree with it
+bit-for-bit, and dev/btm_corpus_check.c exists to prove that it does.
+
+    python3 dev/btm_corpus_root.py dev/data/edu_fineweb10B/*.bin -o corpus_root.json
+
+Writes the root, n_leaves and n_tokens, plus the level-0 leaf hashes if --save-leaves is
+given, so a miner can produce proofs without re-reading 20 GB.
+"""
+import argparse
+import glob
+import hashlib
+import json
+import struct
+import sys
+
+LEAF_TOKENS = 64
+LEAF_BYTES = LEAF_TOKENS * 2
+HEADER_BYTES = 1024
+
+
+def h_leaf(b):
+    return hashlib.sha256(b"\x00" + b).digest()
+
+
+def h_node(l, r):
+    return hashlib.sha256(b"\x01" + l + r).digest()
+
+
+def read_tokens(paths):
+    """Concatenate the uint16 token streams, skipping each shard's 1024-byte header."""
+    out = []
+    total = 0
+    for p in paths:
+        with open(p, "rb") as f:
+            hdr = f.read(HEADER_BYTES)
+            if len(hdr) < HEADER_BYTES:
+                sys.exit(f"{p}: shorter than a header")
+            magic, ver, ntok = struct.unpack("<iii", hdr[:12])
+            if magic != 20240520:
+                sys.exit(f"{p}: bad magic {magic}")
+            body = f.read()
+        if len(body) != ntok * 2:
+            print(f"  warning: {p} header says {ntok:,} tokens, body holds {len(body)//2:,}")
+        out.append(body)
+        total += len(body) // 2
+        print(f"  {p}: {len(body)//2:,} tokens")
+    return b"".join(out), total
+
+
+def build(tokens_bytes):
+    """-> (root, n_leaves, level0_hashes). Odd levels PROMOTE their last node."""
+    n_leaves = len(tokens_bytes) // LEAF_BYTES
+    if n_leaves == 0:
+        sys.exit("corpus is shorter than one leaf")
+    level = [h_leaf(tokens_bytes[i * LEAF_BYTES:(i + 1) * LEAF_BYTES])
+             for i in range(n_leaves)]
+    leaves = list(level)
+    while len(level) > 1:
+        nxt = []
+        for i in range(0, len(level) - 1, 2):
+            nxt.append(h_node(level[i], level[i + 1]))
+        if len(level) & 1:
+            nxt.append(level[-1])   # promote, never duplicate (CVE-2012-2459)
+        level = nxt
+    return level[0], n_leaves, leaves
+
+
+def proof(leaves, index):
+    """The sibling list for `index`, in bottom-up order, omitting promoted levels."""
+    sibs = []
+    level = list(leaves)
+    pos = index
+    while len(level) > 1:
+        if pos + 1 == len(level) and (len(level) & 1):
+            pos //= 2
+            level = [h_node(level[i], level[i + 1]) for i in range(0, len(level) - 1, 2)] + [level[-1]]
+            continue
+        sibs.append(level[pos ^ 1])
+        nxt = [h_node(level[i], level[i + 1]) for i in range(0, len(level) - 1, 2)]
+        if len(level) & 1:
+            nxt.append(level[-1])
+        level = nxt
+        pos //= 2
+    return sibs
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("shards", nargs="+", help="tokenised .bin shards, in order")
+    ap.add_argument("-o", "--out", default="corpus_root.json")
+    ap.add_argument("--emit-header", default="", metavar="PATH",
+                    help="write llmc/btmcorpus_params.h with these constants")
+    ap.add_argument("--save-leaves", default="", metavar="PATH",
+                    help="write the raw level-0 leaf hashes here (32 B each) so a miner "
+                         "can build proofs without re-reading the corpus")
+    args = ap.parse_args()
+
+    paths = []
+    for s in args.shards:
+        paths += sorted(glob.glob(s)) if any(c in s for c in "*?[") else [s]
+    print(f"reading {len(paths)} shard(s)")
+    tokens, n_tokens = read_tokens(paths)
+
+    root, n_leaves, leaves = build(tokens)
+    dropped = n_tokens - n_leaves * LEAF_TOKENS
+    print(f"\nn_tokens  {n_tokens:,}")
+    print(f"n_leaves  {n_leaves:,}  ({LEAF_TOKENS} tokens each, {dropped} trailing tokens dropped)")
+    print(f"depth     {max(0, (n_leaves - 1).bit_length())}")
+    print(f"root      {root.hex()}")
+
+    meta = {"root": root.hex(), "n_leaves": n_leaves, "n_tokens": n_tokens,
+            "leaf_tokens": LEAF_TOKENS, "shards": paths}
+    with open(args.out, "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"\nwrote {args.out}")
+    if args.save_leaves:
+        with open(args.save_leaves, "wb") as f:
+            for h in leaves:
+                f.write(h)
+        print(f"wrote {args.save_leaves}: {32 * len(leaves):,} bytes")
+
+    if args.emit_header:
+        with open(args.emit_header, "w") as f:
+            f.write(f"""/*
+Corpus commitment constants. CONSENSUS: changing either value changes what the work IS,
+so it is a new algo branch and a new vote. Generated by dev/btm_corpus_root.py -- do not
+hand-edit; re-run the tool over the corpus and paste its output.
+
+Currently: {" ".join(paths)}
+*/
+#ifndef BTMCORPUS_PARAMS_H
+#define BTMCORPUS_PARAMS_H
+
+#define BTM_CORPUS_ROOT_HEX "{root.hex()}"
+#define BTM_CORPUS_N_LEAVES {n_leaves}ull
+
+//! The scored sequence length. A leaf is BTMC_LEAF_TOKENS (64) tokens, and a language
+//! model consumes T+1 tokens to score T predictions (inputs[0..T-1] against
+//! targets[1..T], as llmc/dataloader.h reads B*T+1), so one leaf scores T = 63.
+//! Deliberately NOT 64-with-a-second-leaf: crossing a leaf boundary would need two
+//! windows and two proofs for one score.
+#define BTM_CORPUS_SCORE_T 63
+
+#endif // BTMCORPUS_PARAMS_H
+""")
+        print(f"wrote {args.emit_header}")
+
+    print(f"""
+Put these in the verifier module as consensus constants:
+
+    #define BTM_CORPUS_ROOT_HEX "{root.hex()}"
+    #define BTM_CORPUS_N_LEAVES {n_leaves}ull
+
+Changing either is a new algo branch and a new vote -- correctly, since it changes what
+the work IS.""")
+
+
+if __name__ == "__main__":
+    main()

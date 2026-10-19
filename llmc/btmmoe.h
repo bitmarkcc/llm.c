@@ -36,9 +36,18 @@ Record entry types added to btmrecord.h's 0 (sparse overwrite) and 1 (LoRA):
 #define BTMMOE_H
 
 #include "btmrecord.h"
+#include "btmcorpus.h"
 
 #define BTM2_DELTA_LORA_EXPERT 2
 #define BTM2_DELTA_DENSE 3
+//! Corpus-commitment proof: the 64-token window this record was scored on, plus a Merkle
+//! path to the corpus root in the verifier module. Carries NO weight delta -- it is how a
+//! verifier with no filesystem obtains the tokens to score. MUST be the record's LAST
+//! entry: the window index is derived from a prefix of the chaining preimage that ends
+//! where this entry begins, which is what stops the index depending on itself. See
+//! llmc/btmcorpus.h.
+//!   <u64 leaf_index><64 x u16 tokens><u8 depth><depth x 32B siblings>
+// (both constants are defined in btmcorpus.h, with the wire format.)
 #define BTMMOE_NUM_TENSORS 18
 
 // fill the 18 MoE parameter tensor sizes (Vp = padded vocab)
@@ -323,6 +332,15 @@ static inline size_t btmmoe_entry_size_h(const unsigned char* e, size_t max_byte
         btmmoe_expert_dims_h(type, C, H, &out, &in);
         return 4 + 8 + (size_t)out * r + (size_t)r * in;
     }
+    if (dtype == BTM2_DELTA_CORPUS_PROOF) {
+        if (max_bytes < BTM2_PROOF_FIXED_BYTES) return 0;
+        int depth = e[BTM2_PROOF_FIXED_BYTES - 1];
+        // A hostile depth must not produce an absurd size; 64 bounds any tree a u64 index
+        // can address (BTMC_MAX_DEPTH). A wrong-but-plausible depth simply folds to the
+        // wrong root and the record scores as having no valid solution.
+        if (depth > 64) return 0;
+        return (size_t)BTM2_PROOF_FIXED_BYTES + (size_t)depth * 32;
+    }
     if (dtype == BTM2_DELTA_DENSE || dtype == BTM2_DELTA_SPARSE) {
         if (max_bytes < 8) return 0;
         uint32_t n;
@@ -359,7 +377,10 @@ static inline int btmmoe_apply_record_h(float* params, const unsigned char* rec,
         int layer = e[1];
         int dtype = e[2];
         int r = e[3];
-        if (dtype == BTM2_DELTA_LORA_INT8) {
+        if (dtype == BTM2_DELTA_CORPUS_PROOF) {
+            // Carries the scored window, not a weight delta: nothing to apply. Its
+            // contents are checked by the verifier's scoring path, not here.
+        } else if (dtype == BTM2_DELTA_LORA_INT8) {
             int out, in;
             btmmoe_lora_dims_r(type, C, E, &out, &in);
             uint16_t sA, sB;

@@ -38,12 +38,25 @@ miner; the v2 logic starts at "v2 LoRA miner" near the end of the file.
 // defines: node-side weight-state cache (NOT consensus)
 #include "llmc/btmcache.h"
 
+// defines: corpus-commitment VERIFICATION (freestanding half) + the committed root
+#include "llmc/btmcorpus.h"
+#include "llmc/btmcorpus_params.h"
+
 // trunk configuration (consensus parameters of this chain)
-// E=100 => ~751M total params (~3 GB), the wasm32-safe prototype scale.
-// The settled 32:1 target (E~300, 2.2B, 8.8 GB) needs memory64 or lazy expert
+//
+// E=64 => 496,216,320 total params = 1.849 GiB in f32, which is what FITS the Bitmark
+// verifier's linear-memory cap of 32512 pages (1.984 GiB). The node measured this model
+// at 1.902 GiB with ~84 MiB headroom; see WASM_MAX_MEMORY_PAGES in
+// src/dynamicalgo/wasmexec.cpp. E=100 would be ~751M params (~2.8 GiB) and would NOT
+// load, so it was never the "wasm32-safe prototype scale" an earlier comment here
+// claimed. The settled 32:1 target (E~300, 2.2B, 8.8 GB) needs memory64 or lazy expert
 // loading -- see doc. All machinery below is E-agnostic.
+//
+// CONSENSUS-CRITICAL and must match eval_gpt2_btm_trunk_f32.c: E sizes the router entry
+// (out = E) and therefore the FRAMING of every record, so a miner and a verifier that
+// disagree cannot even walk the same chain file.
 #ifndef MOE_E
-#define MOE_E 100
+#define MOE_E 64
 #endif
 #define MOE_K 4   // active experts per token
 #define MOE_H 384 // expert hidden width (C/2): fine-grained experts
@@ -1479,6 +1492,16 @@ void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes) {
     }
     if (need_init || applied_any) {
         if (last_head_off != (size_t)-1) memcpy(newtip, cp + last_head_off, 32);
+#ifndef __wasm__
+        // Never cache the state of a chain supplied by BTM_CHAIN. A candidate record's
+        // folded state is not the real chain's, and the cache is keyed on the last
+        // record's head -- writing it here poisons the next run, which is exactly the
+        // aliasing that made the first compaction measurement report one file's loss for
+        // another. Also keeps candidate scoring cheap: the base stays a cache hit.
+        if (getenv("BTM_CHAIN")) {
+            printf("not caching state: scoring a BTM_CHAIN candidate\n");
+        } else
+#endif
         if (btmcache_save(cache_path, newtip, model->params_memory, model->num_parameters) != 0) {
             printf("warning: could not write state cache\n");
         }
@@ -1528,16 +1551,90 @@ int gpt2_eval_trunk(float* ploss, uchar* block_hash, uchar* cp, size_t cp_bytes)
         printf("WARNING: chained hash does NOT match the record head (wrong block hash argument?)\n");
     }
 
-    unsigned int seed;
-    memcpy(&seed, hash2, 4);
-    manual_seed(&(val_loader.shuffle_rng), seed);
-    dataloader_reset(&val_loader);
-    dataloader_next_batch(&val_loader);
+    // --- the scored window comes from the record, not from a corpus on disk ----------
+    //
+    // A wasm verifier has no filesystem, so it cannot hold a 10B-token corpus or load a
+    // dataloader batch. The record carries the window it was scored on plus a Merkle path
+    // to the root this module commits to; everything checked below arrives in the record,
+    // so verification needs no data availability at all (llmc/btmcorpus.h).
+    //
+    // Any failure here means NO VALID SOLUTION, never block invalidity -- same
+    // fall-through as malformed solution data.
+    const unsigned char* proof = NULL;
+    size_t proof_len = 0, delta_len = 0;
+    {
+        uint16_t n_ent;
+        memcpy(&n_ent, cp + last_off + 32, 2);
+        const unsigned char* e = cp + last_off + BTM2_HEADER_BYTES;
+        size_t left = last_size - BTM2_HEADER_BYTES;
+        for (uint16_t i = 0; i < n_ent; i++) {
+            size_t esz = btmmoe_entry_size_h(e, left, 768, MOE_H, MOE_E);
+            if (esz == 0 || esz > left) { printf("error: malformed entry %u\n", i); return 1; }
+            if (e[2] == BTM2_DELTA_CORPUS_PROOF) {
+                // Must be the LAST entry: the index is derived from the prefix ending
+                // here, so a proof anywhere else would be covered by its own input.
+                if (i + 1 != n_ent) {
+                    printf("no valid solution: corpus proof is entry %u of %u, not last\n",
+                           i, n_ent);
+                    return 1;
+                }
+                proof = e;
+                proof_len = esz;
+            } else {
+                delta_len += esz;
+            }
+            e += esz;
+            left -= esz;
+        }
+    }
+    if (!proof) { printf("no valid solution: record carries no corpus proof\n"); return 1; }
+
+    uint64_t claimed = 0;
+    for (int i = 7; i >= 0; i--) claimed = (claimed << 8) | proof[4 + i];
+    const unsigned char* leaf = proof + 12;
+    int n_sibs = proof[12 + BTMC_LEAF_BYTES];
+    const unsigned char* sibs = proof + 13 + BTMC_LEAF_BYTES;
+
+    // 1. the window must be the one this record's deltas commit to. `preimage` already
+    //    holds prev_head in its first 32 bytes, so the prefix is contiguous.
+    uint64_t expect = btmc_leaf_index(preimage, BTM2_HEADER_BYTES + delta_len,
+                                      BTM_CORPUS_N_LEAVES);
+    if (claimed != expect) {
+        printf("no valid solution: proof names leaf %llu, deltas commit to %llu\n",
+               (unsigned long long)claimed, (unsigned long long)expect);
+        return 1;
+    }
+    // 2. the window must really be in the committed corpus.
+    {
+        unsigned char want[32], got[32];
+        const char* hx = BTM_CORPUS_ROOT_HEX;
+        for (int i = 0; i < 32; i++) {
+            unsigned v; sscanf(hx + 2 * i, "%2x", &v); want[i] = (unsigned char)v;
+        }
+        int rc = btmc_fold(claimed, BTM_CORPUS_N_LEAVES, leaf, sibs, n_sibs, got);
+        if (rc != 0 || memcmp(got, want, 32) != 0) {
+            printf("no valid solution: corpus proof does not fold to the root (rc=%d)\n", rc);
+            return 1;
+        }
+    }
+    printf("corpus proof ok: leaf %llu of %llu, depth %d\n",
+           (unsigned long long)claimed, (unsigned long long)BTM_CORPUS_N_LEAVES, n_sibs);
+
+    // val on the proof's tokens: acts were sized for the training B,T -- free for lazy realloc
+    free(model.acts_memory);
+    model.acts_memory = NULL;
+    int vin[BTM_CORPUS_SCORE_T], vtar[BTM_CORPUS_SCORE_T];
+    for (int j = 0; j < BTM_CORPUS_SCORE_T; j++) {
+        uint16_t a, b;
+        memcpy(&a, leaf + 2 * j, 2);
+        memcpy(&b, leaf + 2 * (j + 1), 2);
+        vin[j] = (int)a;
+        vtar[j] = (int)b;
+    }
     printf("inputs:");
-    for (int j = 0; j < 64; j++) printf(" %d", val_loader.inputs[j]);
+    for (int j = 0; j < BTM_CORPUS_SCORE_T; j++) printf(" %d", vin[j]);
     printf("\n");
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    gpt2_forward(&model, val_loader.inputs, val_loader.targets, 1, 64);
+    gpt2_forward(&model, vin, vtar, 1, BTM_CORPUS_SCORE_T);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     printf("forward took %.3f s\n", (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);
     float val_loss = model.mean_loss;
@@ -1576,6 +1673,23 @@ int main(int argc, char** argv) {
     }
 
     const char* cpfname = "btm-cp-trunk.bin";
+#ifndef __wasm__
+    // DIAGNOSTIC ONLY, absent from every consensus path (the wasm verifier has no
+    // environment): score a DIFFERENT chain file without moving anything.
+    //
+    // Scoring a compaction against the chain it compacts otherwise means copying each
+    // candidate over btm-cp-trunk.bin in turn, which puts the real chain one skipped
+    // restore away from being overwritten by a synthetic file -- and the synthetic ones
+    // parse perfectly, so nothing complains. Mining state should not be reachable by a
+    // read-only experiment at all.
+    {
+        const char* alt = getenv("BTM_CHAIN");
+        if (alt && *alt) {
+            cpfname = alt;
+            printf("DIAGNOSTIC: reading chain from %s (BTM_CHAIN)\n", cpfname);
+        }
+    }
+#endif
     FILE* cpf = fopen(cpfname, "rb");
     if (!cpf) { printf("error: cannot open %s\n", cpfname); exit(1); }
     fseekCheck(cpf, 0L, SEEK_END);
