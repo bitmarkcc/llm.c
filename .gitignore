@@ -9,6 +9,7 @@
 dev/__pycache__/
 dev/data/__pycache__/
 dev/data/edu_fineweb10B/
+dev/data/edu_fineweb10B_16k/
 dev/data/fineweb10B/
 dev/data/hellaswag/
 dev/data/mmlu/
@@ -69,4 +70,6 @@ btm-cp-trunk-e100.bin
 # working output and the level-0 leaf-hash cache (5 GB at 10B tokens).
 corpus_root.json
 corpus_leaves.bin
+corpus_tree.bin
 dev/btm_corpus_check
+*.bin.bak

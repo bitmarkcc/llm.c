@@ -1401,7 +1401,13 @@ void gpt2_free(GPT2 *model) {
 // Trunk chain verifier (wasm32-wasi compatible; canonical btmk_dot kernel;
 // build with -msimd128 for the bit-identical SIMD128 fast path)
 
-void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes) {
+//! Build the trunk weights, applying only the records that start below `cp_limit`.
+//!
+//! The caller passes the offset of the record being SCORED, so what comes back is the
+//! state that record is an improvement OVER -- see gpt2_eval_trunk for why the score is
+//! a difference. `cp_limit == cp_bytes` applies the whole chain.
+void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes, size_t cp_limit) {
+    if (cp_limit > cp_bytes) cp_limit = cp_bytes;
     model->config.num_layers = 12;
     model->config.channels = 768;
     model->config.num_heads = 12;
@@ -1447,9 +1453,12 @@ void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes) {
         if (memcmp(cache_tip, gen, 32) == 0) {
             need_init = 0; // cached bare init; all records still to apply
         } else {
+            // Only records BELOW the limit may be resumed from: a cached tip at or past
+            // it describes a state that already includes the record we are about to
+            // score, which would make the improvement come out as zero.
             size_t off = 0;
-            while (off < cp_bytes) {
-                size_t rsz = btmmoe_record_size_h(cp + off, cp_bytes - off, 768, MOE_H, MOE_E);
+            while (off < cp_limit) {
+                size_t rsz = btmmoe_record_size_h(cp + off, cp_limit - off, 768, MOE_H, MOE_E);
                 if (rsz == 0) break;
                 if (memcmp(cp + off, cache_tip, 32) == 0) { need_init = 0; start_off = off + rsz; break; }
                 off += rsz;
@@ -1472,16 +1481,18 @@ void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes) {
     size_t off = start_off;
     size_t last_head_off = (size_t)-1;
     {
-        size_t o2 = 0; // tip must reflect the FULL chain end, walk for the last head
-        while (o2 < cp_bytes) {
-            size_t rsz = btmmoe_record_size_h(cp + o2, cp_bytes - o2, 768, MOE_H, MOE_E);
+        // The tip must name the last record this build APPLIES, not the last in the
+        // file: the cache stores the state at cp_limit.
+        size_t o2 = 0;
+        while (o2 < cp_limit) {
+            size_t rsz = btmmoe_record_size_h(cp + o2, cp_limit - o2, 768, MOE_H, MOE_E);
             if (rsz == 0) break;
             last_head_off = o2;
             o2 += rsz;
         }
     }
-    while (off < cp_bytes) {
-        size_t rsz = btmmoe_record_size_h(cp + off, cp_bytes - off, 768, MOE_H, MOE_E);
+    while (off < cp_limit) {
+        size_t rsz = btmmoe_record_size_h(cp + off, cp_limit - off, 768, MOE_H, MOE_E);
         if (rsz == 0) { printf("error: malformed trunk chain record at offset %zu\n", off); exit(1); }
         if (btmmoe_apply_record_h(model->params_memory, cp + off, rsz,
                                   12, 768, MOE_E, MOE_H, model->param_sizes, moe_offsets) != 0) {
@@ -1508,19 +1519,34 @@ void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes) {
     }
 }
 
-int gpt2_eval_trunk(float* ploss, uchar* block_hash, uchar* cp, size_t cp_bytes) {
+//! Score the LAST record of `cp` by how much it IMPROVES the loss of the chain before it,
+//! on the window that record commits to.
+//!
+//! WHY A DIFFERENCE AND NOT A LOSS. The window is 63 token predictions chosen by the
+//! record's own deltas, and window difficulty varies by ~0.75 nats across the corpus --
+//! far more than 30 LoRA steps move the loss. An absolute loss therefore reports which
+//! window a record drew, not what it learned, and best-of-n over absolute loss is
+//! rejection sampling on the draw: measured directly, two attempts whose training
+//! trajectories agreed to four decimals scored 8.342280 and 7.592348 purely because they
+//! landed on leaf 2926 versus leaf 3287.
+//!
+//! Differencing against the SAME window removes it exactly. Both forwards below run on
+//! identical tokens, so whatever that window costs cancels, and what is left is the
+//! record's own contribution. Subtracting two f32 losses is exact in IEEE, so the
+//! improvement is as reproducible as the losses are.
+//!
+//! `*ploss` gets the loss with the record applied, `*pbase_loss` the loss without it;
+//! the improvement is their difference, in that order.
+int gpt2_eval_trunk(float* ploss, float* pbase_loss, uchar* block_hash,
+                    uchar* cp, size_t cp_bytes) {
 
     GPT2 model;
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    gpt2_build_from_chain_trunk(&model, cp, cp_bytes);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    printf("model build took %.3f s\n", (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);
 
-    const char* train_tokens = "dev/data/tinyshakespeare16k/tiny_shakespeare16k_train.bin";
-    DataLoader val_loader;
-    dataloader_init(&val_loader, train_tokens, 1, 64, 0, 1, 1); // val = 64 tokens
-
+    // The chain walk and the whole proof check come BEFORE any weights are built: they
+    // need no model, and a record with a bad proof should cost a verifier a few hashes
+    // rather than a full model build.
     size_t off = 0;
     size_t last_off = 0, last_size = 0;
     size_t prev_off = (size_t)-1;
@@ -1620,9 +1646,7 @@ int gpt2_eval_trunk(float* ploss, uchar* block_hash, uchar* cp, size_t cp_bytes)
     printf("corpus proof ok: leaf %llu of %llu, depth %d\n",
            (unsigned long long)claimed, (unsigned long long)BTM_CORPUS_N_LEAVES, n_sibs);
 
-    // val on the proof's tokens: acts were sized for the training B,T -- free for lazy realloc
-    free(model.acts_memory);
-    model.acts_memory = NULL;
+    // The window, as next-token pairs: a 64-token leaf scores 63 predictions.
     int vin[BTM_CORPUS_SCORE_T], vtar[BTM_CORPUS_SCORE_T];
     for (int j = 0; j < BTM_CORPUS_SCORE_T; j++) {
         uint16_t a, b;
@@ -1634,17 +1658,55 @@ int gpt2_eval_trunk(float* ploss, uchar* block_hash, uchar* cp, size_t cp_bytes)
     printf("inputs:");
     for (int j = 0; j < BTM_CORPUS_SCORE_T; j++) printf(" %d", vin[j]);
     printf("\n");
+
+    // --- the baseline: the chain WITHOUT this record ---------------------------------
+    //
+    // `last_off` is where the scored record begins, so the build stops just short of it.
+    // For the first record of a chain last_off is 0 and the baseline is the bare
+    // fixed-seed init, which is the correct thing to improve on.
+    gpt2_build_from_chain_trunk(&model, cp, cp_bytes, last_off);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    printf("model build took %.3f s\n", (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);
+
+    gpt2_forward(&model, vin, vtar, 1, BTM_CORPUS_SCORE_T);
+    float base_loss = model.mean_loss;
+    printf("base loss %f\n", base_loss);
+
+    // --- apply the scored record and measure the same window again -------------------
+    {
+        size_t moe_offsets[BTMMOE_NUM_TENSORS];
+        btmmoe_tensor_offsets(model.param_sizes, moe_offsets);
+        if (btmmoe_apply_record_h(model.params_memory, cp + last_off, last_size,
+                                  12, 768, MOE_E, MOE_H, model.param_sizes,
+                                  moe_offsets) != 0) {
+            printf("no valid solution: cannot apply the scored record\n");
+            gpt2_free(&model);
+            free(preimage);
+            return 1;
+        }
+    }
+    // Same B,T as the baseline forward, so the activation buffers are reused rather than
+    // reallocated -- and, more to the point, the two losses come from the same code path
+    // over the same tokens, differing only in the weights.
     gpt2_forward(&model, vin, vtar, 1, BTM_CORPUS_SCORE_T);
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    printf("forward took %.3f s\n", (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);
+    printf("two forwards took %.3f s\n", (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);
     float val_loss = model.mean_loss;
     printf("val loss %f\n", val_loss);
     uint32_t loss_bits;
     memcpy(&loss_bits, &val_loss, 4);
     printf("val loss bits = %08x\n", loss_bits);
 
+    // THE SCORE. Exact in IEEE: both operands are f32 and the subtraction is a single
+    // rounded operation, so every verifier that agrees on the two losses agrees on this.
+    float improvement = base_loss - val_loss;
+    uint32_t imp_bits;
+    memcpy(&imp_bits, &improvement, 4);
+    printf("improvement %+.8f\n", improvement);
+    printf("improvement bits = %08x\n", imp_bits);
+
     *ploss = val_loss;
-    dataloader_free(&val_loader);
+    if (pbase_loss) *pbase_loss = base_loss;
     gpt2_free(&model);
     free(preimage);
     return 0;
@@ -1702,11 +1764,12 @@ int main(int argc, char** argv) {
 
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
-    float loss = -1.0f;
-    int ret = gpt2_eval_trunk(&loss, block_hash, cp, cp_bytes);
+    float loss = -1.0f, base_loss = -1.0f;
+    int ret = gpt2_eval_trunk(&loss, &base_loss, block_hash, cp, cp_bytes);
     clock_gettime(CLOCK_MONOTONIC, &end);
     double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-    printf("eval took %.3f s (loss %f)\n", time_elapsed_s, loss);
+    printf("eval took %.3f s (base %f, loss %f, improvement %+.8f)\n",
+           time_elapsed_s, base_loss, loss, base_loss - loss);
 
     free(cp);
     if (block_hash) free(block_hash);

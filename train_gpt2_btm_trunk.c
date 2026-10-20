@@ -1592,7 +1592,12 @@ int gpt2_train_trunk(float* ploss, uchar** p_record, size_t* p_record_bytes,
                (size_t)mout[i] * min_[i] * sizeof(float));
     }
 
-    const char* train_tokens = "dev/data/tinyshakespeare16k/tiny_shakespeare16k_train.bin";
+    // The committed corpus, as a glob over its shards in sorted order -- the same string
+    // serves the DataLoader (which globs too) and btmcb_corpus_open. It must be the corpus
+    // llmc/btmcorpus_params.h was generated from; btmcb_corpus_open checks the leaf count
+    // against BTM_CORPUS_N_LEAVES and refuses to mine against anything else.
+    const char* train_tokens = getenv("BTM_CORPUS");
+    if (!train_tokens) train_tokens = "dev/data/edu_fineweb10B_16k/edu_fineweb16k_*.bin";
     int B = 4;
     int T = 64;
     DataLoader train_loader, val_loader;
@@ -1744,34 +1749,58 @@ int gpt2_train_trunk(float* ploss, uchar** p_record, size_t* p_record_bytes,
     const size_t prefix_len = BTM2_HEADER_BYTES + delta_bytes;
     uint64_t leaf_index = btmc_leaf_index(rec, prefix_len, BTM_CORPUS_N_LEAVES);
 
-    uchar leaf[BTMC_LEAF_BYTES];
-    if (btmcb_read_leaf(train_tokens, leaf_index, leaf) != 0) {
-        printf("error: cannot read corpus leaf %llu from %s\n",
-               (unsigned long long)leaf_index, train_tokens);
-        exit(1);
-    }
-    // Level-0 hashes: from the cache dev/btm_corpus_root.py --save-leaves writes if it is
-    // there, else rehashed from the corpus. The cache matters at 10B tokens, where
-    // rehashing is minutes; at this scale either is instant.
-    uint64_t nl = 0;
-    uchar* leaves = btmcb_load_leaves("corpus_leaves.bin", &nl);
-    if (!leaves || nl != BTM_CORPUS_N_LEAVES) {
-        free(leaves);
-        leaves = btmcb_build_leaves(train_tokens, &nl);
-    }
-    if (!leaves || nl != BTM_CORPUS_N_LEAVES) {
+    btmcb_corpus corpus;
+    if (btmcb_corpus_open(&corpus, train_tokens) != 0) exit(1);
+    if (corpus.n_leaves != BTM_CORPUS_N_LEAVES) {
         printf("error: corpus has %llu leaves, BTM_CORPUS_N_LEAVES is %llu -- "
                "re-run dev/btm_corpus_root.py --emit-header\n",
-               (unsigned long long)nl, (unsigned long long)BTM_CORPUS_N_LEAVES);
+               (unsigned long long)corpus.n_leaves, (unsigned long long)BTM_CORPUS_N_LEAVES);
         exit(1);
     }
+    uchar leaf[BTMC_LEAF_BYTES];
+    if (btmcb_corpus_read_leaf(&corpus, leaf_index, leaf) != 0) {
+        printf("error: cannot read corpus leaf %llu\n", (unsigned long long)leaf_index);
+        exit(1);
+    }
+    // The sibling path. Two routes, and the fast one is strongly preferred:
+    //
+    //   corpus_tree.bin (btm_corpus_root.py --save-tree) holds every level, so a path is
+    //   one 32-byte read per level: 0.04 ms, no residency, flat in corpus size.
+    //
+    //   Without it, the level-0 array has to be loaded (or rehashed) and folded, which is
+    //   O(n_leaves): measured at 5.7 ms for 4279 leaves and 17 s for 12.5M, i.e. ~240 s
+    //   and ~6 GB resident at 177M. Correct, but it would dominate mining.
     uchar sibs[BTMC_MAX_DEPTH * 32];
     int n_sibs = 0;
-    if (btmcb_path(leaves, nl, leaf_index, sibs, &n_sibs) != 0) {
-        printf("error: cannot build a path for leaf %llu\n", (unsigned long long)leaf_index);
-        exit(1);
+    const char* treef = getenv("BTM_CORPUS_TREE");
+    if (!treef) treef = "corpus_tree.bin";
+    int prc = btmcb_path_from_tree(treef, BTM_CORPUS_N_LEAVES, leaf_index, sibs, &n_sibs);
+    if (prc != 0) {
+        printf("%s unusable (rc=%d); falling back to folding the level-0 array. "
+               "Generate it with dev/btm_corpus_root.py --save-tree to avoid this.\n",
+               treef, prc);
+        uint64_t nl = 0;
+        uchar* leaves = btmcb_load_leaves("corpus_leaves.bin", &nl);
+        if (!leaves || nl != BTM_CORPUS_N_LEAVES) {
+            free(leaves);
+            printf("corpus_leaves.bin missing or stale; rehashing %llu leaves\n",
+                   (unsigned long long)corpus.n_leaves);
+            leaves = btmcb_build_leaves(&corpus, &nl);
+        }
+        if (!leaves || nl != BTM_CORPUS_N_LEAVES) {
+            printf("error: have %llu level-0 hashes, BTM_CORPUS_N_LEAVES is %llu\n",
+                   (unsigned long long)nl, (unsigned long long)BTM_CORPUS_N_LEAVES);
+            exit(1);
+        }
+        // Consumes `leaves` (folds in place) rather than copying it: at 177M leaves a
+        // copy would add 6 GB to the miner's peak for no benefit.
+        if (btmcb_path_destructive(leaves, nl, leaf_index, sibs, &n_sibs) != 0) {
+            printf("error: cannot build a path for leaf %llu\n", (unsigned long long)leaf_index);
+            exit(1);
+        }
+        free(leaves);
     }
-    free(leaves);
+    btmcb_corpus_close(&corpus);
 
     // Self-check before publishing: fold our own proof with the VERIFIER's code and
     // compare against the committed root. A miner that skips this publishes records every
@@ -1852,9 +1881,13 @@ int gpt2_train_trunk(float* ploss, uchar** p_record, size_t* p_record_bytes,
 //! subprocess and a fold per attempt; the verifier's state cache absorbs the base, and it
 //! deliberately does not write the cache under BTM_CHAIN, so candidates cannot poison it.
 //!
-//! Returns 0 and sets *ploss on success.
+//! Returns 0 and sets *pimprov (the score), *ploss and *pbase on success. `*pimprov` is
+//! base_loss - val_loss on the record's own window: see gpt2_eval_trunk in the verifier
+//! for why the absolute loss is not the figure to select on.
 static int btm_score_with_verifier(const uchar* cp, size_t cp_bytes,
-                                   const uchar* rec, size_t rec_bytes, float* ploss) {
+                                   const uchar* rec, size_t rec_bytes,
+                                   const uchar* block_hash,
+                                   float* pimprov, float* ploss, float* pbase) {
     const char* evalbin = getenv("BTM_EVAL");
     if (!evalbin) evalbin = "./eval_gpt2_btm_trunk_f32";
     const char* tmp = "btm-candidate-chain.bin";
@@ -1865,18 +1898,31 @@ static int btm_score_with_verifier(const uchar* cp, size_t cp_bytes,
     if (fwrite(rec, 1, rec_bytes, f) != rec_bytes) { fclose(f); return -3; }
     fclose(f);
 
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "BTM_CHAIN=%s %s 2>&1", tmp, evalbin);
+    // The anchor hash MUST reach the verifier. For the genesis record it is the record's
+    // prev_head, and btmc_leaf_index hashes that preimage -- so a verifier that fell back
+    // to the 0xff sentinel would derive a different scoring leaf and reject the record as
+    // having no valid solution. For later records it is ignored (the verifier takes
+    // prev_head from the chain), so passing it is always right and never harmful.
+    char cmd[1024], anchor[80];
+    anchor[0] = '\0';
+    if (block_hash) {
+        anchor[0] = ' ';
+        for (int i = 0; i < 32; i++) snprintf(anchor + 1 + 2 * i, 3, "%02x", block_hash[i]);
+    }
+    snprintf(cmd, sizeof(cmd), "BTM_CHAIN=%s %s%s 2>&1", tmp, evalbin, anchor);
     FILE* pp = popen(cmd, "r");
     if (!pp) { printf("score: cannot run %s\n", evalbin); return -4; }
     char line[4096];
-    int got = 0;
-    float loss = 0.0f;
+    int got_loss = 0, got_base = 0;
+    float loss = 0.0f, base = 0.0f;
     while (fgets(line, sizeof(line), pp)) {
-        // The verifier prints "val loss %f"; take the LAST one in case a future version
-        // prints more than one.
+        // Take the LAST of each in case a future version prints more than one. Match
+        // "base loss" before "val loss": the latter is not a substring of the former, but
+        // keeping the order explicit stops a reordering from silently crossing them.
+        const char* b = strstr(line, "base loss ");
+        if (b && sscanf(b + 10, "%f", &base) == 1) { got_base = 1; continue; }
         const char* m = strstr(line, "val loss ");
-        if (m && sscanf(m + 9, "%f", &loss) == 1) got = 1;
+        if (m && sscanf(m + 9, "%f", &loss) == 1) got_loss = 1;
         if (strstr(line, "no valid solution")) {
             printf("score: verifier rejects the candidate: %s", line);
             pclose(pp);
@@ -1885,8 +1931,14 @@ static int btm_score_with_verifier(const uchar* cp, size_t cp_bytes,
     }
     pclose(pp);
     remove(tmp);
-    if (!got) { printf("score: no val loss in the verifier's output\n"); return -6; }
+    if (!got_loss) { printf("score: no val loss in the verifier's output\n"); return -6; }
+    if (!got_base) { printf("score: no base loss in the verifier's output\n"); return -7; }
+    // Recomputed here rather than parsed: the printed improvement is decimal text, and
+    // the difference of the two parsed f32 losses is the exact value the verifier
+    // computed. Nothing depends on the verifier's formatting.
+    *pimprov = base - loss;
     *ploss = loss;
+    *pbase = base;
     return 0;
 }
 
@@ -1940,7 +1992,15 @@ int main(int argc, char** argv) {
         }
     }
 
-    float best_loss = FLT_MAX;
+    // Select on IMPROVEMENT, not on loss.
+    //
+    // Each attempt's window is chosen by its own deltas, and window difficulty varies by
+    // far more than 30 LoRA steps can move the loss, so picking the lowest absolute loss
+    // picks whichever attempt drew the easiest 63 tokens. The improvement differences
+    // that away: base and candidate are scored on the same window inside the verifier, so
+    // the window's cost cancels and what remains is the delta's own contribution.
+    float best_improv = -FLT_MAX;
+    float best_loss = 0.0f, best_base = 0.0f;
     uchar* best_rec = 0;
     size_t best_rec_bytes = 0;
     for (int i = 0; i < n_attempts; i++) {
@@ -1948,21 +2008,25 @@ int main(int argc, char** argv) {
         uchar* rec = 0;
         size_t rec_bytes = 0;
         gpt2_train_trunk(&loss, &rec, &rec_bytes, block_hash, cp, cp_bytes, 12, seed_offset + (unsigned int)i);
-        // The number that decides anything is the VERIFIER's, so selection uses it. The
-        // miner's own forward pass above is kept only as an advisory figure; the gap
+        // The numbers that decide anything are the VERIFIER's, so selection uses them.
+        // The miner's own forward pass above is kept only as an advisory figure; the gap
         // between them is the -Ofast/-O2 float-semantics difference and is worth seeing.
-        float advisory = loss, vloss = 0.0f;
-        if (btm_score_with_verifier(cp, cp_bytes, rec, rec_bytes, &vloss) != 0) {
+        float advisory = loss, vloss = 0.0f, vbase = 0.0f, improv = 0.0f;
+        if (btm_score_with_verifier(cp, cp_bytes, rec, rec_bytes, block_hash,
+                                    &improv, &vloss, &vbase) != 0) {
             printf("main() attempt seed %u: could not be scored by the verifier; skipped\n",
                    seed_offset + (unsigned int)i);
             free(rec);
             continue;
         }
-        loss = vloss;
-        printf("main() attempt seed %u: verifier val loss %f (miner said %f, delta %+.3e)\n",
-               seed_offset + (unsigned int)i, vloss, advisory, (double)(advisory - vloss));
-        if (loss < best_loss) {
-            best_loss = loss;
+        printf("main() attempt seed %u: improvement %+.8f (base %f -> %f; "
+               "miner said %f, delta %+.3e)\n",
+               seed_offset + (unsigned int)i, improv, vbase, vloss,
+               advisory, (double)(advisory - vloss));
+        if (improv > best_improv) {
+            best_improv = improv;
+            best_loss = vloss;
+            best_base = vbase;
             free(best_rec);
             best_rec = rec;
             best_rec_bytes = rec_bytes;
@@ -1970,7 +2034,22 @@ int main(int argc, char** argv) {
             free(rec);
         }
     }
-    printf("best_loss = %f\n", best_loss);
+    if (!best_rec) {
+        printf("no attempt could be scored; nothing to append\n");
+        free(cp);
+        if (block_hash) free(block_hash);
+        return 1;
+    }
+    printf("best improvement = %+.8f (base %f -> %f)\n", best_improv, best_base, best_loss);
+    if (best_improv <= 0.0f) {
+        // Appended anyway: the accept/reject threshold is a CONSENSUS rule (design B's
+        // nbits-to-loss gate) and does not belong in the miner, which has no say in what
+        // a verifier accepts. But a chain of records that each make the model worse is
+        // not a knowledge base, so this should be loud.
+        printf("WARNING: the best attempt does not improve the model. Appending it still, "
+               "since the accept threshold is a consensus rule, but a chain built out of "
+               "records like this one gets worse, not better.\n");
+    }
 
     cpf = fopen(cpfname, "ab");
     if (!cpf) { printf("error opening %s for append\n", cpfname); exit(1); }

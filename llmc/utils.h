@@ -223,6 +223,15 @@ bool in_uint_array (uint32_t* arr, size_t arr_len, uint32_t val) {
 
 size_t hex_to_uchar (unsigned char** pout, const char* hex) { // todo check hex is valid
     size_t len = strlen(hex)/2;
+    // An empty string yields NO buffer, not an empty one. malloc(0) returns a non-NULL
+    // pointer to zero bytes, and every caller here is of the form
+    //     len = hex_to_uchar(&block_hash, argv[1]);
+    //     ... if (!block_hash) block_hash = mallocCheck(32);
+    // so a zero-byte block silently passes the NULL guard and the next memcpy writes 32
+    // bytes into it. That is a heap overflow whose symptom is a crash inside the
+    // allocator, far from the cause -- and `prog '' <n>` is the natural way to reach a
+    // later positional argument, so it is easy to hit.
+    if (len == 0) { *pout = NULL; return 0; }
     *pout = (unsigned char*)malloc(len);
     for (int i=0; i<len; i++) {
 	const char* s = hex+2*i;

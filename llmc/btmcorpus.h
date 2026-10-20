@@ -10,8 +10,8 @@ that the window really came from the committed corpus. Verification then needs n
 availability at all -- everything it checks arrives in the record. Only MINING needs the
 corpus, which is the right place for that burden.
 
-LEAVES. The corpus is the uint16 little-endian token stream exactly as dev/data/*.py
-writes it, with the 1024-byte header skipped. Leaf i is tokens [64i, 64i+64):
+LEAVES. The corpus is the uint16 little-endian token stream exactly as the tokenisers in
+dev/data write it, with the 1024-byte header skipped. Leaf i is tokens [64i, 64i+64):
 
     n_leaves = n_tokens / 64          (integer division; trailing tokens are DROPPED --
                                        the count is a consensus constant and must not
@@ -44,6 +44,30 @@ preserves commit-then-evaluate exactly as the old in-corpus val batch did: a min
 fix its deltas before it can learn which tokens will score them, so it cannot train on
 the window it will be judged on. The record's chained head is unchanged and still covers
 everything, proof included.
+
+The window is drawn from the whole corpus, training slice included, and that is correct:
+the trunk's objective is to compress THIS corpus into weights, so held-in loss is the
+thing being bought. It does leave the index grindable in principle -- the training slice
+is fixed by the block hash before mining starts, while the index is a function of the
+deltas, so a miner could retrain attempts until the window landed inside its own slice
+and collect an improvement that is really memorisation of 7,680 tokens. What makes that
+worthless is arithmetic, not a mechanism:
+
+    ASSUMPTION, and the only thing holding the attack off:
+        n_steps * B * T  <<  BTMC_LEAF_TOKENS * n_leaves
+    i.e. the training slice must stay negligible against the corpus.
+
+A record trains on n_steps*B*T = 30*4*64 = 7,680 tokens (120 leaves). Against 10B tokens
+(156.25M leaves) the window lands in the slice with probability 7.7e-7, so forcing it
+takes ~1.3M attempts of a full train plus a verifier call -- months per record. Against
+the 273,884-token tinyshakespeare corpus used for testing the same figure is 2.8% and ~36
+attempts, which is trivial; measurements on a corpus that small carry the caveat that
+roughly one record in 36 is scored on tokens it trained on and reads high.
+
+So this is a property of the HYPERPARAMETERS, not of the format. If n_steps or the batch
+ever grows until a record trains on a noticeable fraction of the corpus, overlap becomes
+common, the window stops being an unbiased estimate of corpus-wide improvement, and the
+grinding attack comes back. Re-check the margin above whenever those change.
 */
 #ifndef BTMCORPUS_H
 #define BTMCORPUS_H
