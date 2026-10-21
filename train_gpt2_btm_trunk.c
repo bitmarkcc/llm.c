@@ -1598,11 +1598,31 @@ int gpt2_train_trunk(float* ploss, uchar** p_record, size_t* p_record_bytes,
     // against BTM_CORPUS_N_LEAVES and refuses to mine against anything else.
     const char* train_tokens = getenv("BTM_CORPUS");
     if (!train_tokens) train_tokens = "dev/data/edu_fineweb10B_16k/edu_fineweb16k_*.bin";
-    int B = 4;
-    int T = 64;
-    DataLoader train_loader, val_loader;
+    // Training shape: MINER-SIDE ONLY, and overridable so it can be swept.
+    //
+    // Nothing in the record format depends on these. The entry list is
+    // L*(3 + 2*TRUNK_EXPERTS_PER_BLOCK) deltas whose dimensions come from C, E and H, so
+    // two miners using different B, T or n_steps emit byte-compatible records. What makes
+    // that worth exploiting: a verifier's cost is FIXED at one model build plus two
+    // forwards at B=1, T=BTM_CORPUS_SCORE_T, whatever the miner did. So scaling miner
+    // work costs the network nothing, and the verifier's 1.984 GiB linear-memory cap
+    // constrains only its own scoring pass -- never this, which is a native binary.
+    //
+    // That is the right shape for proof-of-work: the cost falls on the producer, and a
+    // record is judged on the improvement it demonstrates rather than on effort claimed.
+    int B = 4, T = 64, n_steps = 30;
+    { const char* s = getenv("BTM_TRAIN_B");     if (s && atoi(s) > 0) B = atoi(s); }
+    { const char* s = getenv("BTM_TRAIN_T");     if (s && atoi(s) > 0) T = atoi(s); }
+    { const char* s = getenv("BTM_TRAIN_STEPS"); if (s && atoi(s) > 0) n_steps = atoi(s); }
+    if (T > 1024) { printf("error: T=%d exceeds the model's max_seq_len of 1024\n", T); exit(1); }
+    printf("train shape: B=%d T=%d steps=%d -> %lld tokens per record\n",
+           B, T, n_steps, (long long)n_steps * B * T);
+
+    // Only the TRAIN loader. The scored window comes from the corpus proof, not a
+    // dataloader batch, so the old val_loader was dead weight -- and dataloader_init
+    // validates every shard by opening it, which is 108 opens to build something unused.
+    DataLoader train_loader;
     dataloader_init(&train_loader, train_tokens, B, T, 0, 1, 1);
-    dataloader_init(&val_loader, train_tokens, 1, 64, 0, 1, 1); // val = 64 tokens
 
     // Seed the TRAIN loader from the chain, not from the attempt.
     //
@@ -1628,8 +1648,18 @@ int gpt2_train_trunk(float* ploss, uchar** p_record, size_t* p_record_bytes,
         printf("train data slice seeded from the chain (seed %u)\n", data_seed);
     }
 
+    // Learning rate: miner-side like B/T/n_steps, and the one worth sweeping.
+    //
+    // Adam normalises gradient magnitude, so a step moves a parameter by roughly lr
+    // whatever the batch size. fB starts at zero, so after n_steps updates
+    // |B| ~ n_steps*lr and |dW| ~ |A|*|B|*sqrt(r) ~ 0.02 * n_steps*lr * 2. Measured at
+    // matched token budget: n_steps*lr of 0.03 gave +0.019 and 0.48 gave +0.156, while a
+    // 16x larger batch at fixed n_steps moved +0.009 to +0.019 -- inside the noise. So
+    // the delta's MAGNITUDE is what buys improvement, n_steps and lr set it jointly, and
+    // tokens barely enter. If that holds, lr buys in 3 minutes what n_steps buys in 45.
     float lr = 1e-3f, beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f;
-    int n_steps = 30;
+    { const char* s = getenv("BTM_TRAIN_LR"); if (s && atof(s) > 0.0) lr = (float)atof(s); }
+    printf("train lr=%g (n_steps*lr = %g)\n", (double)lr, (double)n_steps * lr);
     for (int step = 0; step < n_steps; step++) {
         for (int i = 0; i < n_mat; i++) {
             int out = mout[i], in = min_[i];
@@ -1700,16 +1730,29 @@ int gpt2_train_trunk(float* ploss, uchar** p_record, size_t* p_record_bytes,
     // The corpus proof rides LAST, after every delta entry: the window index is derived
     // from a prefix of this very buffer that ends where the proof begins, which is what
     // keeps the index from depending on itself (llmc/btmcorpus.h).
-    const int proof_depth = btmc_depth(BTM_CORPUS_N_LEAVES);
-    const size_t proof_bytes = (size_t)BTM2_PROOF_FIXED_BYTES + (size_t)proof_depth * 32;
-    size_t rec_bytes = BTM2_HEADER_BYTES + delta_bytes + proof_bytes;
+    //
+    // The buffer is sized for the DEEPEST possible path, but a record's actual proof can
+    // be shorter: a leaf whose ancestor is the promoted last node of an odd level skips
+    // that level's sibling. That is not an edge case -- for 167,205,693 leaves the width
+    // is odd at level 25, whose promoted node covers leaves [134217728, n), i.e. 19.7% of
+    // the corpus. So rec_bytes is PROVISIONAL here and is trimmed to the real length once
+    // the proof is written; the chained hash must cover exactly the published bytes and
+    // not a tail of uninitialised heap, which a verifier would never read back because it
+    // derives the entry size from the declared depth byte.
+    const int proof_depth_max = btmc_depth(BTM_CORPUS_N_LEAVES);
+    const size_t proof_bytes_max = (size_t)BTM2_PROOF_FIXED_BYTES + (size_t)proof_depth_max * 32;
+    size_t rec_bytes = BTM2_HEADER_BYTES + delta_bytes + proof_bytes_max;
     uchar* rec = (uchar*)mallocCheck(rec_bytes);
     if (block_hash) memcpy(rec, block_hash, 32);
     else memset(rec, 255, 32);
     uint16_t n_entries = (uint16_t)(n_mat + 1);  // + the corpus proof
     memcpy(rec + 32, &n_entries, 2);
     uchar* e = rec + BTM2_HEADER_BYTES;
+    // Where each entry landed, so the diagnostic below can re-apply the quantized delta
+    // from the record's own bytes rather than re-deriving it.
+    uchar** rec_entry = (uchar**)mallocCheck((size_t)n_mat * sizeof(uchar*));
     for (int i = 0; i < n_mat; i++) {
+        rec_entry[i] = e;
         int out = mout[i], in = min_[i];
         uint16_t tensor_id = (uint16_t)((mlayer[i] << 8) | mtype[i]);
         memcpy(e, &tensor_id, 2);
@@ -1818,13 +1861,18 @@ int gpt2_train_trunk(float* ploss, uchar** p_record, size_t* p_record_bytes,
         }
     }
     size_t wrote = btmcb_write_proof_entry(rec + prefix_len, leaf_index, leaf, sibs, n_sibs);
-    if (wrote != proof_bytes) {
-        printf("error: proof entry is %zu bytes, expected %zu\n", wrote, proof_bytes);
+    if (wrote > proof_bytes_max) {
+        printf("error: proof entry is %zu bytes, buffer holds %zu\n", wrote, proof_bytes_max);
         exit(1);
     }
-    printf("corpus proof: leaf %llu of %llu, depth %d, %zu bytes\n",
+    // Trim to what was actually written. A promoted-level path is shorter than the
+    // deepest one, and the record must end where its last entry ends -- a verifier sizes
+    // the entry from its declared depth, so any slack would desynchronise the chain walk
+    // and would also put uninitialised bytes under the chained hash.
+    rec_bytes = prefix_len + wrote;
+    printf("corpus proof: leaf %llu of %llu, depth %d, %zu bytes (record %zu bytes)\n",
            (unsigned long long)leaf_index, (unsigned long long)BTM_CORPUS_N_LEAVES,
-           n_sibs, proof_bytes);
+           n_sibs, wrote, rec_bytes);
 
     uchar hash[32], hash2[32];
     sha256_hash(rec, rec_bytes, hash);
@@ -1850,18 +1898,93 @@ int gpt2_train_trunk(float* ploss, uchar** p_record, size_t* p_record_bytes,
     printf("inputs:");
     for (int j = 0; j < BTM_CORPUS_SCORE_T; j++) printf(" %d", vin[j]);
     printf("\n");
+
+    // --- DIAGNOSTIC: where does the record's improvement go? -------------------------
+    //
+    // Measured over records 2..10 of the 10.7B chain, the per-record improvement is
+    // -0.0059 +/- 0.0076 -- indistinguishable from zero, and negative from record 7 on.
+    // Two causes would produce that and they call for opposite fixes:
+    //
+    //   (a) 30 steps over 7,680 tokens learns nothing generalizable, so the lever is
+    //       more work per record (steps, batch, rank);
+    //   (b) it DOES learn something, and quantizing the factors to int8 + two fp16
+    //       scales injects more error than the step gained, so the lever is the delta
+    //       format (higher rank, or per-row scales instead of one scale per factor).
+    //
+    // Scoring the float delta and the quantized delta on the SAME window separates
+    // them. Three forwards over 1x63 tokens, ~3 s against ~165 s of training.
+    //
+    // Not consensus: only the quantized figure is what a verifier reconstructs, and the
+    // model is left holding the quantized delta exactly as before.
+    float base_loss_local = 0.0f, unquant_loss = 0.0f;
+    {
+        // 1. base alone: restore every frozen matrix, no delta at all.
+        for (int i = 0; i < n_mat; i++) {
+            memcpy(model.params_memory + woff[i], wfrozen + foff[i],
+                   (size_t)mout[i] * min_[i] * sizeof(float));
+        }
+        gpt2_forward(&model, vin, vtar, 1, BTM_CORPUS_SCORE_T);
+        base_loss_local = model.mean_loss;
+
+        // 2. the FLOAT delta, applied exactly as the training loop does.
+        for (int i = 0; i < n_mat; i++) {
+            int out = mout[i], in = min_[i];
+            float* W = model.params_memory + woff[i];
+            memcpy(W, wfrozen + foff[i], (size_t)out * in * sizeof(float));
+            const float* A = fA + aoff[i];
+            const float* Bm = fB + boff[i];
+            for (int oc = 0; oc < out; oc++) {
+                for (int j = 0; j < r; j++) {
+                    float a = A[(size_t)oc * r + j];
+                    if (a == 0.0f) continue;
+                    const float* Brow = Bm + (size_t)j * in;
+                    float* Wrow = W + (size_t)oc * in;
+                    for (int ic = 0; ic < in; ic++) Wrow[ic] += a * Brow[ic];
+                }
+            }
+        }
+        gpt2_forward(&model, vin, vtar, 1, BTM_CORPUS_SCORE_T);
+        unquant_loss = model.mean_loss;
+
+        // 3. back to the QUANTIZED delta -- the state the record encodes, and the one
+        //    the advisory val loss below must report.
+        for (int i = 0; i < n_mat; i++) {
+            int out = mout[i], in = min_[i];
+            uchar* ei = rec_entry[i];
+            uint16_t sA, sB;
+            int8_t* qA;
+            if (mexpert[i] < 0) {
+                memcpy(&sA, ei + 4, 2); memcpy(&sB, ei + 6, 2);
+                qA = (int8_t*)(ei + 8);
+            } else {
+                memcpy(&sA, ei + 8, 2); memcpy(&sB, ei + 10, 2);
+                qA = (int8_t*)(ei + 12);
+            }
+            int8_t* qB = qA + (size_t)out * r;
+            float* W = model.params_memory + woff[i];
+            memcpy(W, wfrozen + foff[i], (size_t)out * in * sizeof(float));
+            btm2_apply_lora_int8(W, out, in, r, qA, qB, sA, sB);
+        }
+    }
+
     gpt2_forward(&model, vin, vtar, 1, BTM_CORPUS_SCORE_T);
     float val_loss = model.mean_loss;
     printf("attempt seed %u: val loss %f\n", attempt_seed, val_loss);
+    printf("attempt seed %u: DIAG base %f  float-delta %f  quantized %f\n",
+           attempt_seed, base_loss_local, unquant_loss, val_loss);
+    printf("attempt seed %u: DIAG improvement float %+.8f  quantized %+.8f  "
+           "quantization cost %+.8f\n",
+           attempt_seed, base_loss_local - unquant_loss, base_loss_local - val_loss,
+           val_loss - unquant_loss);
 
     *ploss = val_loss;
     *p_record = rec;
     *p_record_bytes = rec_bytes;
     dataloader_free(&train_loader);
-    dataloader_free(&val_loader);
+
     gpt2_free(&model);
     free(mtype); free(mlayer); free(mexpert); free(mout); free(min_);
-    free(woff); free(aoff); free(boff); free(foff);
+    free(woff); free(aoff); free(boff); free(foff); free(rec_entry);
     free(fA); free(fB); free(dA); free(dB); free(fm); free(fv); free(wfrozen);
     return 0;
 }
@@ -2051,11 +2174,20 @@ int main(int argc, char** argv) {
                "records like this one gets worse, not better.\n");
     }
 
-    cpf = fopen(cpfname, "ab");
-    if (!cpf) { printf("error opening %s for append\n", cpfname); exit(1); }
-    size_t written = fwrite(best_rec, 1, best_rec_bytes, cpf);
-    printf("wrote %zu bytes (record) to %s\n", written, cpfname);
-    fcloseCheck(cpf);
+    // Measurement runs need the numbers without the side effect. Appending the best of n
+    // attempts also appends the most selection-biased record there is -- the max of n
+    // draws from an estimator whose noise exceeds its mean -- so a run done purely to
+    // measure the improvement distribution would degrade the very chain it measures.
+    if (getenv("BTM_NO_APPEND")) {
+        printf("BTM_NO_APPEND set: not appending to %s (record was %zu bytes)\n",
+               cpfname, best_rec_bytes);
+    } else {
+        cpf = fopen(cpfname, "ab");
+        if (!cpf) { printf("error opening %s for append\n", cpfname); exit(1); }
+        size_t written = fwrite(best_rec, 1, best_rec_bytes, cpf);
+        printf("wrote %zu bytes (record) to %s\n", written, cpfname);
+        fcloseCheck(cpf);
+    }
 
     free(best_rec);
     free(cp);
