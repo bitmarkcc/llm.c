@@ -44,19 +44,44 @@ miner; the v2 logic starts at "v2 LoRA miner" near the end of the file.
 
 // trunk configuration (consensus parameters of this chain)
 //
-// E=64 => 496,216,320 total params = 1.849 GiB in f32, which is what FITS the Bitmark
-// verifier's linear-memory cap of 32512 pages (1.984 GiB). The node measured this model
-// at 1.902 GiB with ~84 MiB headroom; see WASM_MAX_MEMORY_PAGES in
-// src/dynamicalgo/wasmexec.cpp. E=100 would be ~751M params (~2.8 GiB) and would NOT
-// load, so it was never the "wasm32-safe prototype scale" an earlier comment here
-// claimed. The settled 32:1 target (E~300, 2.2B, 8.8 GB) needs memory64 or lazy expert
-// loading -- see doc. All machinery below is E-agnostic.
+// E=32 => 269,428,992 total params = 1.004 GiB in f32. An expert is 2 * C*H * L =
+// 2 * 768*384 * 12 = 7,077,888 params, so halving E from 64 frees 226M params.
 //
-// CONSENSUS-CRITICAL and must match eval_gpt2_btm_trunk_f32.c: E sizes the router entry
-// (out = E) and therefore the FRAMING of every record, so a miner and a verifier that
-// disagree cannot even walk the same chain file.
+// NOT chosen to fit the verifier's 1.984 GiB linear-memory cap -- E=64 (1.849 GiB) fit
+// that. Chosen for the CHECKPOINT BUDGET.
+//
+// verify() must stream the weight checkpoint AND fold every delta published since it,
+// inside GAS_IO_BYTES_LIMIT (2 GiB) and GAS_IO_CALLS_LIMIT (4096). A smaller model leaves
+// room for more deltas per epoch, and at 16 min per slot block (NUM_ALGOS=8 x 2 min) that
+// is the length of the mining period between checkpoints:
+//
+//     E=64:  1.8485 GiB checkpoint -> 272 deltas fit ->  3.0 days of mining per epoch
+//     E=32:  1.0021 GiB checkpoint -> 1508 deltas fit -> 16.8 days of mining per epoch
+//
+// E=64 also made the checkpoint unpublishable in practice: 1.85 GiB takes ~2,036 slot
+// blocks (22.6 days) to transmit against a 3.0-day staleness bound, so it could never be
+// kept current, forcing dedicated publish phases and a ~12% useful-work duty cycle.
+//
+// A secondary gain: the model build streams half as much, ~19.6 s -> ~10 s measured.
+//
+// The freed linear memory (139 MiB -> 1006 MiB under the cap, against 52.7 MiB per
+// scoring window) would also permit scoring a record on ~19 windows instead of 1, which
+// would cut the gate's estimator noise as sqrt(W), sigma 0.067 -> ~0.015. That is NOT
+// done, and the blocker is gas, not memory: the forward is compute-bound (~4.4 FLOP per
+// weight byte), so W windows cost ~W times the instruction count, and the existing two
+// forwards already sit near GAS_LIMIT[GC_SIMD]. See the note at the scoring site in
+// eval_gpt2_btm_trunk_f32.c. E=32 keeps that option open for the day those limits are
+// revisited; it does not take it.
+//
+// The cost is half the trunk's expert capacity, which is a real loss for something whose
+// purpose is to BE a knowledge base. The settled 32:1 target (E~300, 2.2B, 8.8 GB) needs
+// memory64 or lazy expert loading -- see doc. All machinery below is E-agnostic.
+//
+// CONSENSUS-CRITICAL and must match the other file: E sizes the router entry (out = E)
+// and therefore the FRAMING of every record, and it sizes the base init and the expert
+// rotation, so a miner and a verifier that disagree cannot even walk the same chain.
 #ifndef MOE_E
-#define MOE_E 64
+#define MOE_E 32
 #endif
 #define MOE_K 4   // active experts per token
 #define MOE_H 384 // expert hidden width (C/2): fine-grained experts
@@ -2122,6 +2147,17 @@ int main(int argc, char** argv) {
     // picks whichever attempt drew the easiest 63 tokens. The improvement differences
     // that away: base and candidate are scored on the same window inside the verifier, so
     // the window's cost cancels and what remains is the delta's own contribution.
+    // Same nBits the verifier will use: popen inherits the environment, so one
+    // BTM_NBITS setting reaches both and the miner's PASS/FAIL matches the verdict.
+    uint32_t gate_nbits = BTM_GATE_NBITS_0;
+    {
+        const char* s = getenv("BTM_NBITS");
+        if (s && *s) gate_nbits = (uint32_t)strtoul(s, NULL, 0);
+    }
+    printf("gate: nbits %08x vs D0 %08x -> difficulty scale %g\n",
+           gate_nbits, (unsigned)BTM_GATE_NBITS_0,
+           (double)btmmoe_difficulty_scale(BTM_GATE_NBITS_0, gate_nbits));
+
     float best_improv = -FLT_MAX;
     float best_loss = 0.0f, best_base = 0.0f;
     uchar* best_rec = 0;
@@ -2142,10 +2178,12 @@ int main(int argc, char** argv) {
             free(rec);
             continue;
         }
+        int passes = btmmoe_gate_passes(vbase, vloss, gate_nbits);
         printf("main() attempt seed %u: improvement %+.8f (base %f -> %f; "
-               "miner said %f, delta %+.3e)\n",
+               "miner said %f, delta %+.3e) -- gate needs %+.8f: %s\n",
                seed_offset + (unsigned int)i, improv, vbase, vloss,
-               advisory, (double)(advisory - vloss));
+               advisory, (double)(advisory - vloss),
+               btmmoe_gate_required(vbase, gate_nbits), passes ? "PASS" : "FAIL");
         if (improv > best_improv) {
             best_improv = improv;
             best_loss = vloss;
@@ -2164,14 +2202,16 @@ int main(int argc, char** argv) {
         return 1;
     }
     printf("best improvement = %+.8f (base %f -> %f)\n", best_improv, best_base, best_loss);
-    if (best_improv <= 0.0f) {
-        // Appended anyway: the accept/reject threshold is a CONSENSUS rule (design B's
-        // nbits-to-loss gate) and does not belong in the miner, which has no say in what
-        // a verifier accepts. But a chain of records that each make the model worse is
-        // not a knowledge base, so this should be loud.
-        printf("WARNING: the best attempt does not improve the model. Appending it still, "
-               "since the accept threshold is a consensus rule, but a chain built out of "
-               "records like this one gets worse, not better.\n");
+    if (!btmmoe_gate_passes(best_base, best_loss, gate_nbits)) {
+        // Appended anyway: this is a local experiment chain, and refusing would hide the
+        // failures that the measurements are made of. On a real chain the record simply
+        // would not be a solution -- a verifier rejects it and the miner retries, exactly
+        // as with a nonce that misses its target. At 1/64 roughly 40% of honest
+        // full-effort attempts land here, which is difficulty, not a defect.
+        printf("WARNING: the best attempt FAILS the gate (needed %+.8f, got %+.8f). "
+               "Appending anyway because this is an experiment chain; a real verifier "
+               "would score it as having no valid solution.\n",
+               btmmoe_gate_required(best_base, gate_nbits), best_improv);
     }
 
     // Measurement runs need the numbers without the side effect. Appending the best of n

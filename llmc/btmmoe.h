@@ -50,6 +50,258 @@ Record entry types added to btmrecord.h's 0 (sparse overwrite) and 1 (LoRA):
 // (both constants are defined in btmcorpus.h, with the wire format.)
 #define BTMMOE_NUM_TENSORS 18
 
+/*
+THE VALIDITY GATE. CONSENSUS-CRITICAL: this is what makes a record a solution.
+
+A record is valid when the loss it removes is at least a 1/64 fraction of the loss it
+started from, both measured on the record's own scoring window:
+
+    base_loss - val_loss  >=  base_loss * 2^-BTM_GATE_SHIFT
+
+RELATIVE, NOT ABSOLUTE, because the achievable improvement shrinks as the trunk learns:
++1.26 for the genesis record, +0.153 by record 11. Any fixed threshold is eventually
+above what an honest record can achieve, and the chain then stalls permanently. A
+fraction of the loss rescales itself with the model. It also matches how the quantity
+behaves -- base loss and improvement correlate across windows (r ~ 0.75 over four
+samples), since a harder window leaves more room to improve.
+
+A POWER OF TWO, because it makes the comparison exact. base_loss * 2^-6 is an exponent
+decrement with no rounding, and near the threshold base_loss and val_loss are within a
+factor of two, so by Sterbenz their difference is exact too. Every verifier therefore
+agrees bit-for-bit with no tolerance to argue about. (Far from the threshold the
+subtraction may round, but only where the outcome is not in doubt.)
+
+WHY 1/64 and not 1/128. Measured at 480 steps, lr 1e-3: improvement mean 0.153,
+sigma 0.067. The cheapest shortcut that still scores above zero is 120 steps, a quarter
+of the work: mean 0.0217, sigma 0.040. Against a base loss of ~8.67:
+
+    threshold   honest pass   shortcut pass   honest advantage per minute
+    1/128       90%           12.6%           1.75x   -- nearly free-riding
+    1/64        60%            0.23%          ~65x
+
+At 1/128 a miner doing a quarter of the work earns over half the honest rate. At 1/64 the
+shortcut needs a 2.8 sigma window draw instead of 1.1 and collapses. Honest attempts
+failing is not a defect: a record that misses the gate simply is not a solution and the
+miner retries, exactly as a nonce that misses a target. 1/64 costs ~1.7 attempts per
+valid record.
+
+CAVEAT, recorded because the exponent depends on it: those means are n=4 each and the
+shortcut's 0.23% is a Gaussian-tail extrapolation from four points, not an observation.
+Real tails run fatter. 1/64 and 1/128 differ by ~37x in discrimination, so the
+uncertainty argues for the tighter exponent -- loosening a consensus constant later is
+the easier direction to move.
+*/
+#define BTM_GATE_SHIFT 6
+#define BTM_GATE_FRACTION (1.0f / (float)(1u << BTM_GATE_SHIFT))
+
+/*
+AND IT RETARGETS, because a fixed fraction eventually cannot be met.
+
+"Reduce the loss by 1/64" demands exponential improvement forever: after N records the
+loss must be <= base * (63/64)^N, which over 272 records is 8.6 -> 0.12 nats. Web text
+has an irreducible entropy floor far above that, and total loss is that floor plus a
+reducible part, so a fixed fraction of the TOTAL becomes an ever-larger fraction of what
+is actually reducible. Depending on where the floor sits (2..4 nats) the 1/64 gate stops
+being satisfiable by anyone after roughly 50..90 records, and the chain would stall
+permanently -- the same failure as an absolute threshold, one step further out.
+
+So the requirement is scaled by the slot's DIFFICULTY, reusing the node's existing
+per-slot retargeting rather than inventing a second control loop:
+
+    required = base_loss * 2^-BTM_GATE_SHIFT * (D / D_0),    D proportional to 1/target
+
+It self-corrects in the right direction with nobody tuning it. As the model improves the
+achievable improvement falls, records become scarce, the slot's blocks slow down,
+difficulty retargets DOWN, and the bar follows. If someone finds better training, records
+arrive fast, difficulty rises, and the bar rises with it.
+
+Two feedback paths are coupled here -- falling loss lowers the bar, which speeds blocks,
+which raises difficulty, which raises the bar. Difficulty retargeting is the fast explicit
+loop and loss drifts slowly, so this should be stable, but it is worth simulating before
+it is relied on.
+*/
+
+//! The nBits this algo activated at: D_0, the difficulty the gate calls 1.0.
+//! CONSENSUS and PLACEHOLDER -- must be pinned to the slot's actual nBits at activation
+//! before this ships. Until then it is set so that nbits == BTM_GATE_NBITS_0 gives a
+//! scale of exactly 1 and the gate behaves as the unscaled 1/64 rule.
+#ifndef BTM_GATE_NBITS_0
+#define BTM_GATE_NBITS_0 0x1d00ffffu
+#endif
+
+/*
+SOLUTION-RATE RETARGETING.
+
+The nBits scaling below is INERT as a feedback loop and survives only as a scale factor.
+Fall-through means a slot block with no valid solution is still a VALID block -- it merely
+goes unpaid -- so the slot's block rate, and hence its nBits, is independent of whether
+anyone can meet the gate. Records becoming unachievable does not slow blocks, so nBits
+never falls and the bar never follows. Observed: a 3-record E=32 chain stalled with 6 of 8
+attempts failing, and nothing in the native difficulty would ever have noticed.
+
+What tracks solution scarcity is the verdict history, exposed per slot block as
+chain.slot_block_solution_valid(i). COUNTING beats timing here, twice over: the native
+retargeting already pins the slot interval to ~16 min (NUM_ALGOS=8 x nPowTargetSpacing=2
+min) so a count per W blocks IS a rate, and a verdict probe costs one I/O call and ZERO
+bytes where reading a timestamp means fetching a ~593 KB block for 4 bytes of header.
+
+With V valid solutions among the last W slot blocks and a target fraction t:
+
+    g = g_0 * 2^(2(V - tW)/K)            required = base_loss * g
+
+WHY THIS IS STATELESS, which is the whole point. The obvious design stores the difficulty
+in each record and validates the transition, as Bitcoin stores nBits in a header. That
+cannot work here: records exist only when solutions are VALID, so a stalled chain has no
+record to carry the difficulty forward and the gate could never loosen itself out of the
+stall. Every slot block carries a verdict whether or not it carries a solution, so
+deriving g from verdicts is what makes recovery possible at all. The price of
+statelessness is that range, responsiveness and noise are all tied to W and K -- there is
+no cumulative term to decouple them.
+
+WHY t IS NOT 1. A target of "every block solved" is a boundary, so the loop loses its
+error signal: V < W says loosen and V = W says nothing, because V cannot exceed W. g would
+ratchet down until everything passes and stay there however easy it became. V = W is
+unreachable regardless -- an honest full-effort record fails ~40% of the time at g_0 on
+the scoring-window draw alone (sigma 0.067 against mean 0.153, measured), and sequential
+records with a 16-min interval leave some blocks with no finished attempt. Driving the bar
+below the honest distribution also destroys what the gate is for: at g -> 0 an 11-minute
+120-step record is worth the same as a 45-minute 480-step one, so miners rationally race
+to the floor, and the only thing left is `improvement > 0`, which we measured records
+passing at +0.0096.
+
+WHY t = 3/4 RATHER THAN 1/2. A failed record is not like a failed hash: it throws away
+real training, so wasted attempts have a cost that hash PoW does not pay. t trades that
+against discrimination -- at the median (t=1/2) the shortcut needs a 3.3 sigma window draw
+and honest work wins ~245x per minute; at the 25th percentile (t=3/4) it needs 2.2 sigma
+for ~12x, with three quarters of attempts landing instead of half.
+
+WHAT W=512, K=64, t=3/4 ACTUALLY GIVE. Derived, and checked against pow() to 5.6e-08
+across all 513 values of V:
+
+    loosening range (V -> 0)      2^-12 = 1/4096
+    tightening range (V -> W)     2^4   = 16x        <-- the weak axis, see below
+    step per block                2^(2/64) = +2.2%
+    binomial jitter               sigma_V = sqrt(W*t*(1-t)) = 9.8 -> +/-24% in g
+    recovery, 10x looser          ~142 blocks ~ 38 h
+    recovery, 100x looser         ~283 blocks ~ 3.1 days
+
+KNOWN LIMITATION: only 16x of TIGHTENING. The gate must track the improvement a miner can
+achieve in one 16-min block interval, and that scales with mining hardware; our own
+measurements come from one CPU thread at ~45 tokens/s, where a GPU would be ~1000x faster.
+If achievable improvement ever rises by more than 16x, V saturates at W, the loop loses
+its error signal in that direction, and the gate stops applying pressure -- the same
+degenerate state as targeting t=1. K=32 would give 256x (and halve recovery) at the cost
+of doubling the jitter to +/-53%; that is the first constant to revisit if saturation is
+ever observed. Loosening is generously ranged by comparison, which is the right asymmetry:
+a stalled chain produces NO useful work, while a too-easy gate still produces some.
+
+EXPECT A SLOW START. A fresh chain's achievable improvement collapses far faster than this
+rule averages: the measured E=32 chain fell ~100x between genesis and depth 3 (0.148 ->
+0.0015 as a fraction of loss) while the window spans 512 blocks. So a new chain stalls for
+roughly its first 3 days while the gate catches up. That is a slow controller meeting a
+fast transient, not a defect.
+
+NOT YET WIRED: verify() does not call solution_valid, so nothing computes V. This is the
+rule; the chain-access path that feeds it is the remaining work.
+*/
+#define BTM_GATE_WINDOW 512        //!< W: slot blocks counted (~5.7 days at 16 min)
+#define BTM_GATE_DAMP 64           //!< K: one extra valid solution moves g by 2^(2/K)
+#define BTM_GATE_TARGET_NUM 3      //!< t = NUM/DEN of the window expected to be valid
+#define BTM_GATE_TARGET_DEN 4
+
+//! 2^(1/2^(n+1)) for n = 0..5, enough to build any 2^(f/64) for integer f.
+static const double btmmoe_root2_[6] = {
+    1.4142135623730951, 1.1892071150027210, 1.0905077326652577,
+    1.0442737824274138, 1.0218971486541166, 1.0108892860517005
+};
+
+//! The gate fraction g for a window of `window` slot blocks holding `valid` valid
+//! solutions. Returns exactly BTM_GATE_FRACTION when the window is on target.
+//!
+//! A `window` of 0 -- a chain younger than the averaging period, where no rate exists
+//! yet -- yields the base fraction, which is the right default rather than an extreme.
+static inline float btmmoe_gate_fraction(uint32_t valid, uint32_t window) {
+    if (window == 0u) return BTM_GATE_FRACTION;
+    if (valid > window) valid = window;           /* nonsense input: clamp, never UB */
+    long target = ((long)window * BTM_GATE_TARGET_NUM) / BTM_GATE_TARGET_DEN;
+    long num = 2 * ((long)valid - target);        /* g = g_0 * 2^(num/K) */
+
+    long whole = num / BTM_GATE_DAMP;
+    long frac  = num % BTM_GATE_DAMP;             /* C99: sign follows num */
+    double g = (double)BTM_GATE_FRACTION;
+    for (long i = 0; i < whole; i++) g *= 2.0;    /* exact */
+    for (long i = 0; i > whole; i--) g *= 0.5;    /* exact */
+    if (frac) {
+        int neg = frac < 0;
+        long f = neg ? -frac : frac;              /* 0 < f < K = 2^6 */
+        for (int b = 0; b < 6; b++) {
+            if (f & (1L << b)) {                  /* bit b contributes 2^(2^b / 64) */
+                double r = btmmoe_root2_[5 - b];
+                g = neg ? g / r : g * r;
+            }
+        }
+    }
+    return (float)g;
+}
+
+//! D/D_0 = target_0/target, from two compact nBits values.
+//!
+//! Computed from the compact FIELDS rather than by materialising two 256-bit targets and
+//! dividing: target = mantissa * 2^(8*(exponent-3)), so
+//!
+//!     target_0/target = (m0/m) * 2^(8*(e0-e))
+//!
+//! Both mantissas are 23-bit, hence exact in f64, and the power of two is applied by
+//! exact doubling. That removes the only real hazard in this idea -- a 256-bit-to-float
+//! conversion whose rounding would have to be specified and matched by every verifier.
+static inline float btmmoe_difficulty_scale(uint32_t nbits0, uint32_t nbits) {
+    uint32_t m0 = nbits0 & 0x007fffffu;
+    uint32_t m  = nbits  & 0x007fffffu;
+    int e0 = (int)(nbits0 >> 24);
+    int e  = (int)(nbits  >> 24);
+    if (m0 == 0u || m == 0u) {
+        // A zero mantissa is not a legal target. Return a scale that makes the
+        // requirement unmeetable rather than trivially met.
+        float huge = 1.0f;
+        for (int i = 0; i < 40; i++) huge *= 1e3f;   // -> +inf
+        return huge;
+    }
+    double q = (double)m0 / (double)m;
+    int k = 8 * (e0 - e);
+    if (k > 512) k = 512;            // clamp: a hostile nBits must not overflow the loop
+    if (k < -512) k = -512;
+    while (k > 0) { q *= 2.0; k--; }
+    while (k < 0) { q *= 0.5; k++; }
+    return (float)q;
+}
+
+//! Does this record clear the gate? `base_loss` is the loss of the chain WITHOUT the
+//! record, `val_loss` with it, both on the record's own window.
+//!
+//! The test is phrased as `improvement >= required` rather than as a rejection
+//! `improvement < required`, so that a NaN loss -- from a delta that poisons the forward
+//! pass -- is REJECTED. Every comparison against NaN is false, which makes the positive
+//! form fail closed and the negated form fail OPEN. The difference is a record that
+//! should score as having no valid solution being accepted instead.
+//!
+//! `improvement > 0` is required independently of the scaled threshold. Difficulty can
+//! retarget down to the slot's pow limit, which drives `required` toward zero, and a
+//! zero requirement would admit a record that changes nothing -- or, with the >= test,
+//! one that makes the model worse by nothing at all. A record must improve the model to
+//! be a solution, at any difficulty; that is the floor the scaling may not erode.
+static inline int btmmoe_gate_passes(float base_loss, float val_loss, uint32_t nbits) {
+    float improvement = base_loss - val_loss;
+    float required = base_loss * BTM_GATE_FRACTION
+                   * btmmoe_difficulty_scale(BTM_GATE_NBITS_0, nbits);
+    return improvement > 0.0f && improvement >= required;
+}
+
+//! The requirement itself, for reporting.
+static inline float btmmoe_gate_required(float base_loss, uint32_t nbits) {
+    return base_loss * BTM_GATE_FRACTION
+         * btmmoe_difficulty_scale(BTM_GATE_NBITS_0, nbits);
+}
+
 // fill the 18 MoE parameter tensor sizes (Vp = padded vocab)
 static inline void btmmoe_fill_param_sizes(size_t* param_sizes, int Vp, int maxT, int L, int C, int E) {
     param_sizes[0]  = (size_t)Vp * C;              // wte

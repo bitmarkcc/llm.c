@@ -301,10 +301,11 @@ eval_gpt2_btm_moe_f32: eval_gpt2_btm_moe_f32.c
 eval_gpt2_btm_moe_f32.wasm: eval_gpt2_btm_moe_f32.c
 	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 $^ -o $@ -nodefaultlibs -lc $(WASI_BUILTINS)
 
-# trunk: C=768, V=16384, fine experts H=384, k=4, E=64 -- 496M params, 1.849 GiB in f32,
-# which is what fits the verifier's 1.984 GiB linear-memory cap (E=100 does not; E~300
-# needs memory64). E must match between the miner and the verifier: it sizes the router
-# entry and therefore the framing of every record.
+# trunk: C=768, V=16384, fine experts H=384, k=4, E=32 -- 269M params, 1.004 GiB in f32.
+# E=64 (1.849 GiB) also fit the verifier's 1.984 GiB cap, but left only ~81 MiB free;
+# E=32 leaves ~1004 MiB, enough to batch ~16 scoring windows and cut the gate's noise by
+# 4x. E must match between the miner and the verifier: it sizes the router entry and
+# therefore the framing of every record.
 train_gpt2_btm_trunk: train_gpt2_btm_trunk.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
 

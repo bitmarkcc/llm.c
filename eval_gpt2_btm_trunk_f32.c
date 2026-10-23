@@ -44,19 +44,44 @@ miner; the v2 logic starts at "v2 LoRA miner" near the end of the file.
 
 // trunk configuration (consensus parameters of this chain)
 //
-// E=64 => 496,216,320 total params = 1.849 GiB in f32, which is what FITS the Bitmark
-// verifier's linear-memory cap of 32512 pages (1.984 GiB). The node measured this model
-// at 1.902 GiB with ~84 MiB headroom; see WASM_MAX_MEMORY_PAGES in
-// src/dynamicalgo/wasmexec.cpp. E=100 would be ~751M params (~2.8 GiB) and would NOT
-// load, so it was never the "wasm32-safe prototype scale" an earlier comment here
-// claimed. The settled 32:1 target (E~300, 2.2B, 8.8 GB) needs memory64 or lazy expert
-// loading -- see doc. All machinery below is E-agnostic.
+// E=32 => 269,428,992 total params = 1.004 GiB in f32. An expert is 2 * C*H * L =
+// 2 * 768*384 * 12 = 7,077,888 params, so halving E from 64 frees 226M params.
 //
-// CONSENSUS-CRITICAL and must match eval_gpt2_btm_trunk_f32.c: E sizes the router entry
-// (out = E) and therefore the FRAMING of every record, so a miner and a verifier that
-// disagree cannot even walk the same chain file.
+// NOT chosen to fit the verifier's 1.984 GiB linear-memory cap -- E=64 (1.849 GiB) fit
+// that. Chosen for the CHECKPOINT BUDGET.
+//
+// verify() must stream the weight checkpoint AND fold every delta published since it,
+// inside GAS_IO_BYTES_LIMIT (2 GiB) and GAS_IO_CALLS_LIMIT (4096). A smaller model leaves
+// room for more deltas per epoch, and at 16 min per slot block (NUM_ALGOS=8 x 2 min) that
+// is the length of the mining period between checkpoints:
+//
+//     E=64:  1.8485 GiB checkpoint -> 272 deltas fit ->  3.0 days of mining per epoch
+//     E=32:  1.0021 GiB checkpoint -> 1508 deltas fit -> 16.8 days of mining per epoch
+//
+// E=64 also made the checkpoint unpublishable in practice: 1.85 GiB takes ~2,036 slot
+// blocks (22.6 days) to transmit against a 3.0-day staleness bound, so it could never be
+// kept current, forcing dedicated publish phases and a ~12% useful-work duty cycle.
+//
+// A secondary gain: the model build streams half as much, ~19.6 s -> ~10 s measured.
+//
+// The freed linear memory (139 MiB -> 1006 MiB under the cap, against 52.7 MiB per
+// scoring window) would also permit scoring a record on ~19 windows instead of 1, which
+// would cut the gate's estimator noise as sqrt(W), sigma 0.067 -> ~0.015. That is NOT
+// done, and the blocker is gas, not memory: the forward is compute-bound (~4.4 FLOP per
+// weight byte), so W windows cost ~W times the instruction count, and the existing two
+// forwards already sit near GAS_LIMIT[GC_SIMD]. See the note at the scoring site in
+// eval_gpt2_btm_trunk_f32.c. E=32 keeps that option open for the day those limits are
+// revisited; it does not take it.
+//
+// The cost is half the trunk's expert capacity, which is a real loss for something whose
+// purpose is to BE a knowledge base. The settled 32:1 target (E~300, 2.2B, 8.8 GB) needs
+// memory64 or lazy expert loading -- see doc. All machinery below is E-agnostic.
+//
+// CONSENSUS-CRITICAL and must match the other file: E sizes the router entry (out = E)
+// and therefore the FRAMING of every record, and it sizes the base init and the expert
+// rotation, so a miner and a verifier that disagree cannot even walk the same chain.
 #ifndef MOE_E
-#define MOE_E 64
+#define MOE_E 32
 #endif
 #define MOE_K 4   // active experts per token
 #define MOE_H 384 // expert hidden width (C/2): fine-grained experts
@@ -1538,7 +1563,7 @@ void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes, size_t
 //! `*ploss` gets the loss with the record applied, `*pbase_loss` the loss without it;
 //! the improvement is their difference, in that order.
 int gpt2_eval_trunk(float* ploss, float* pbase_loss, uchar* block_hash,
-                    uchar* cp, size_t cp_bytes) {
+                    uchar* cp, size_t cp_bytes, uint32_t nbits) {
 
     GPT2 model;
     struct timespec t0, t1;
@@ -1688,6 +1713,20 @@ int gpt2_eval_trunk(float* ploss, float* pbase_loss, uchar* block_hash,
     // Same B,T as the baseline forward, so the activation buffers are reused rather than
     // reallocated -- and, more to the point, the two losses come from the same code path
     // over the same tokens, differing only in the weights.
+    //
+    // GAS: THIS SECOND FORWARD COSTS THE WHOLE MARGIN. src/dynamicalgo/gasclasses.h sets
+    // each per-class limit as max(2 x trunk-count, count for a 0.5 s slice) -- calibrated
+    // against THIS algo, at 2x. One forward over 63 tokens is ~4.38e9 multiply-accumulates
+    // (69.5M active params per token: dense + top-4 experts + lm_head), so with 4 f32
+    // lanes and separate mul/add that is ~2.2e9 SIMD ops against GAS_LIMIT[GC_SIMD] =
+    // 5e9. One forward is ~44% of it; two are ~88%.
+    //
+    // So improvement scoring, which is what makes the gate measurable at all, leaves
+    // almost no headroom. Anything that multiplies the forward work -- more scored
+    // windows, a longer T, a larger top-k -- trips the budget, and tripping gas is not a
+    // slow verifier but a solution scored INVALID. Those counts are estimated from FLOPs,
+    // not measured; contrib/dynamicalgo/aot_harness runs the module under the node's own
+    // instrumentation and is what should settle them before this ships.
     gpt2_forward(&model, vin, vtar, 1, BTM_CORPUS_SCORE_T);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     printf("two forwards took %.3f s\n", (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);
@@ -1705,8 +1744,33 @@ int gpt2_eval_trunk(float* ploss, float* pbase_loss, uchar* block_hash,
     printf("improvement %+.8f\n", improvement);
     printf("improvement bits = %08x\n", imp_bits);
 
+    // Reported before the gate so a rejected record still yields its numbers: the caller
+    // prints them, and a miner needs to see how far short it fell.
     *ploss = val_loss;
     if (pbase_loss) *pbase_loss = base_loss;
+
+    // --- THE GATE (llmc/btmmoe.h) ----------------------------------------------------
+    // Failing it means NO VALID SOLUTION -- the same fall-through as a malformed record
+    // or a proof that does not fold. It never makes the containing block invalid.
+    {
+        float scale = btmmoe_difficulty_scale(BTM_GATE_NBITS_0, nbits);
+        float required = btmmoe_gate_required(base_loss, nbits);
+        uint32_t req_bits;
+        memcpy(&req_bits, &required, 4);
+        printf("gate requires %+.8f (base %f / %d, difficulty scale %g from nbits %08x"
+               " vs D0 %08x), bits = %08x\n",
+               required, base_loss, 1 << BTM_GATE_SHIFT, (double)scale,
+               nbits, (unsigned)BTM_GATE_NBITS_0, req_bits);
+        if (!btmmoe_gate_passes(base_loss, val_loss, nbits)) {
+            printf("no valid solution: improvement %+.8f is below the required %+.8f\n",
+                   improvement, required);
+            gpt2_free(&model);
+            free(preimage);
+            return 1;
+        }
+        printf("gate passed: improvement %+.8f >= %+.8f\n", improvement, required);
+    }
+
     gpt2_free(&model);
     free(preimage);
     return 0;
@@ -1765,7 +1829,15 @@ int main(int argc, char** argv) {
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
     float loss = -1.0f, base_loss = -1.0f;
-    int ret = gpt2_eval_trunk(&loss, &base_loss, block_hash, cp, cp_bytes);
+    // On-chain, nbits is a verify() parameter from the block being validated. Here it
+    // comes from the environment so the harness can exercise the scaling; the default
+    // reproduces D/D_0 = 1, i.e. the unscaled 1/64 rule.
+    uint32_t nbits = BTM_GATE_NBITS_0;
+    {
+        const char* s = getenv("BTM_NBITS");
+        if (s && *s) nbits = (uint32_t)strtoul(s, NULL, 0);
+    }
+    int ret = gpt2_eval_trunk(&loss, &base_loss, block_hash, cp, cp_bytes, nbits);
     clock_gettime(CLOCK_MONOTONIC, &end);
     double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
     printf("eval took %.3f s (base %f, loss %f, improvement %+.8f)\n",
