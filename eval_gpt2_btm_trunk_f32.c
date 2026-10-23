@@ -17,17 +17,25 @@ The model/layer code below (through gpt2_free) is shared verbatim with the v1
 miner; the v2 logic starts at "v2 LoRA miner" near the end of the file.
 */
 
+#include <stdint.h>
+#include <stdbool.h>
+#include <math.h>
+#include <string.h>
+#ifndef __wasm__
+// Host-only: an on-chain module imports nothing but chain.*, and every one of these
+// reaches for WASI -- stdio for fd_write, time for clock_time_get, stdlib for proc_exit.
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
-#include <stdint.h>
 #include <assert.h>
-#include <math.h>
 #include <time.h>
-#include <string.h>
 #include <unistd.h>
 #include <limits.h>
+#endif
 // defines: sha256_hash (self-contained SHA-256; no OpenSSL)
+// defines: BTMLOG / BTM_ABORT / btm_alloc -- the seam between the native
+// harness and an on-chain module, which may import nothing but chain.*
+#include "llmc/btmhost.h"
 #include "llmc/sha256.h"
 // defines: the v2 typed record format, fp16, int8 quant, LoRA expansion, base init
 #include "llmc/btmrecord.h"
@@ -35,8 +43,10 @@ miner; the v2 logic starts at "v2 LoRA miner" near the end of the file.
 #include "llmc/btmmoe.h"
 // defines: btmk_dot / matmul_forward_k -- the canonical 4-accumulator kernel
 #include "llmc/btmkernel.h"
-// defines: node-side weight-state cache (NOT consensus)
+#ifndef __wasm__
+// defines: node-side weight-state cache (NOT consensus; needs stdio)
 #include "llmc/btmcache.h"
+#endif
 
 // defines: corpus-commitment VERIFICATION (freestanding half) + the committed root
 #include "llmc/btmcorpus.h"
@@ -83,6 +93,9 @@ miner; the v2 logic starts at "v2 LoRA miner" near the end of the file.
 #ifndef MOE_E
 #define MOE_E 32
 #endif
+//! Vocabulary. CONSENSUS: sizes wte and the lm_head, so it frames the record's
+//! dense entries exactly as E frames the router's.
+#define TRUNK_VOCAB 16384
 #define MOE_K 4   // active experts per token
 #define MOE_H 384 // expert hidden width (C/2): fine-grained experts
 #include <float.h>
@@ -91,11 +104,17 @@ miner; the v2 logic starts at "v2 LoRA miner" near the end of the file.
 #endif
 // our own utilities
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
-#include "llmc/utils.h"
+#ifndef __wasm__
+#include "llmc/utils.h"   /* fopenCheck/hex_to_uchar: the native harness only */
+#endif
 // defines: tokenizer_init, tokenizer_decode, tokenizer_free
-#include "llmc/tokenizer.h"
+#ifndef __wasm__
+#include "llmc/tokenizer.h"   /* unused by the verifier */
+#endif
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
-#include "llmc/dataloader.h"
+#ifndef __wasm__
+#include "llmc/dataloader.h"   /* the scored window comes from the record, not a loader */
+#endif
 
 typedef unsigned char uchar;
 
@@ -638,7 +657,7 @@ float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes
         num_parameters += param_sizes[i];
     }
     // malloc all parameters all at once
-    float* params_memory = (float*)mallocCheck(num_parameters * sizeof(float));
+    float* params_memory = (float*)btm_alloc(num_parameters * sizeof(float));
     // assign all the tensors
     float** ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
@@ -689,7 +708,7 @@ float* malloc_and_point_activations(ActivationTensors* acts, size_t* act_sizes) 
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
         num_activations += act_sizes[i];
     }
-    float* acts_memory = (float*)mallocCheck(num_activations * sizeof(float));
+    float* acts_memory = (float*)btm_alloc(num_activations * sizeof(float));
     float** ptrs[] = {
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->qkv, &acts->atty,
         &acts->preatt, &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
@@ -738,18 +757,21 @@ typedef struct {
     bool* params_memory_active;
 } GPT2;
 
+// ---- host-only: a model checkpoint file and the v1 random init. Neither is reachable
+// from gpt2_eval_trunk (the trunk builds from the chain), and both need stdio.
+#ifndef __wasm__
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     // read in model from a checkpoint file
     FILE *model_file = fopenCheck(checkpoint_path, "rb");
-    if (model_file == NULL) { printf("Error opening model file\n"); exit(1); }
+    if (model_file == NULL) { BTMLOG("Error opening model file\n"); BTM_ABORT(); }
     int model_header[256];
     freadCheck(model_header, sizeof(int), 256, model_file);
-    if (model_header[0] != 20240326) { printf("Bad magic model file\n"); exit(1); }
+    if (model_header[0] != 20240326) { BTMLOG("Bad magic model file\n"); BTM_ABORT(); }
     if (model_header[1] != 3) {
-        printf("Bad version in model file\n");
-        printf("---> HINT: try to re-run `python train_gpt2.py`\n");
-        exit(1);
+        BTMLOG("Bad version in model file\n");
+        BTMLOG("---> HINT: try to re-run `python train_gpt2.py`\n");
+        BTM_ABORT();
     }
 
     // read in hyperparameters
@@ -760,13 +782,13 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->config.num_heads = NH = model_header[5];
     model->config.channels = C = model_header[6];
     model->config.padded_vocab_size = Vp = model_header[7];
-    printf("[GPT-2]\n");
-    printf("max_seq_len: %zu\n", maxT);
-    printf("vocab_size: %zu\n", V);
-    printf("padded_vocab_size: %zu\n", Vp);
-    printf("num_layers: %zu\n", L);
-    printf("num_heads: %zu\n", NH);
-    printf("channels: %zu\n", C);
+    BTMLOG("[GPT-2]\n");
+    BTMLOG("max_seq_len: %zu\n", maxT);
+    BTMLOG("vocab_size: %zu\n", V);
+    BTMLOG("padded_vocab_size: %zu\n", Vp);
+    BTMLOG("num_layers: %zu\n", L);
+    BTMLOG("num_heads: %zu\n", NH);
+    BTMLOG("channels: %zu\n", C);
 
     // allocate space for all the parameters and read them in
     fill_in_parameter_sizes(model->param_sizes,  model->config);
@@ -776,7 +798,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         num_parameters += model->param_sizes[i];
     }
-    printf("num_parameters: %zu\n", num_parameters);
+    BTMLOG("num_parameters: %zu\n", num_parameters);
     model->num_parameters = num_parameters;
 
     // read in all the parameters from file
@@ -816,7 +838,7 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
     else if (depth == 24) { channels = 1024; num_heads = 16; } // gpt2-medium (350M)
     else if (depth == 36) { channels = 1280; num_heads = 20; } // gpt2-large (774M)
     else if (depth == 48) { channels = 1600; num_heads = 25; } // gpt2-xl (1558M)
-    else { fprintf(stderr, "Unsupported depth for now\n"); exit(EXIT_FAILURE); }
+    else { BTMLOG("Unsupported depth for now\n"); BTM_ABORT(); }
     model->config.channels = channels;
     model->config.num_heads = num_heads;
     model->config.max_seq_len = 1024;
@@ -846,21 +868,21 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 
     //size_t n_active_weights = 4000; // number of weights that will be adjusted (change to 4000)
-    printf("n_active_weights = %lu\n",n_active_weights);
+    BTMLOG("n_active_weights = %lu\n",n_active_weights);
     mt19937_state init_rng_1;
     manual_seed(&init_rng_1, rng_seed_1);
 
     // get a random subset of weights
-    uint32_t* active_weights = malloc(n_active_weights*sizeof(uint32_t));
+    uint32_t* active_weights = btm_alloc(n_active_weights*sizeof(uint32_t));
     size_t n_weights = model->num_parameters;
-    printf("n_weights = %lu\n",n_weights);
+    BTMLOG("n_weights = %lu\n",n_weights);
     for (size_t i=0; i<n_active_weights; i++)
 	active_weights[i] = n_weights; // dummy value
-    bool* params_memory_active = malloc(sizeof(bool)*n_weights);
+    bool* params_memory_active = btm_alloc(sizeof(bool)*n_weights);
     for (size_t i=0; i<n_weights; i++)
 	params_memory_active[i] = false;
     int i_active = 0;
-    printf("rng_seed_1 = %u\n",rng_seed_1);
+    BTMLOG("rng_seed_1 = %u\n",rng_seed_1);
     for (size_t i=0; i<n_active_weights; i++) {
 	// get random number from 0 to n_weights-1, not chosen before
 	while (true) {
@@ -868,7 +890,7 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
 	    if (!params_memory_active[rand_weight]) { // bitmap check, same result as scanning active_weights but O(1)
 		active_weights[i] = rand_weight;
 		params_memory_active[rand_weight] = true;
-		if (i%10000==0) printf("active_weights[%lu] = %u\n",i,active_weights[i]);
+		if (i%10000==0) BTMLOG("active_weights[%lu] = %u\n",i,active_weights[i]);
 		break;
 	    }
 	}
@@ -883,7 +905,7 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
     // allocate and random init the memory for all the parameters with GPT-2 schema
     // weights ~N(0, 0.02), biases 0, c_proj weights ~N(0, 0.02/(2*L)**0.5)
     // NOTE: assuming all parameters are of the type floatX, could be relaxed later
-    float* params_memory_cpu = (float*)mallocCheck(num_parameters_bytes);
+    float* params_memory_cpu = (float*)btm_alloc(num_parameters_bytes);
     memset(params_memory_cpu, 0, num_parameters_bytes);
     // fill in all the weights with random values
     float residual_scale = 1.0f / sqrtf(2.0f * model->config.num_layers);
@@ -911,7 +933,7 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
                 }
                 if (i == 4 || i == 6 || i == 10 || i == 12) {
                     // weight tensors, we are only initializing layer l
-                    assert(n % L == 0);
+                    BTM_ASSERT(n % L == 0);
                     n = n / L;
                     layer_offset = l * n;
                 }
@@ -919,7 +941,7 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
                 // scaled by 1/sqrt(2*L) for training stability
                 float scale = (i == 6 || i == 12) ? 0.02f * residual_scale : 0.02f;
                 // okay let's draw the random numbers and write them
-                float *fp32_buffer = (float*)mallocCheck(n * sizeof(float));
+                float *fp32_buffer = (float*)btm_alloc(n * sizeof(float));
                 normal_(fp32_buffer, n, 0.0f, scale, &init_rng_2);
                 for (size_t j = 0; j < n; j++) {
 		    size_t i_pmc = offset+layer_offset+j;
@@ -930,7 +952,7 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
 			params_memory_cpu[i_pmc] = 0.0f;
 			}*/
                 }
-                free(fp32_buffer);
+                btm_free(fp32_buffer);
             }
             offset += model->param_sizes[i];
         }
@@ -938,7 +960,7 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
 
     // apply checkpoint data
     if (cp_bytes % 8 != 0) {
-	printf("Warning: The size of the checkpoint data is not a multiple of 8. Ignoring it.\n");
+	BTMLOG("Warning: The size of the checkpoint data is not a multiple of 8. Ignoring it.\n");
     }
     else {
 	size_t bytes_scanned = 0;
@@ -955,7 +977,7 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
     
     // copy them to the model
     memcpy(model->params_memory, params_memory_cpu, num_parameters_bytes);
-    free(params_memory_cpu);
+    btm_free(params_memory_cpu);
     //model->params_memory = params_memory_cpu;
 }
 
@@ -964,6 +986,7 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
 // renormalized softmax gates, out = sum_s gate_s * expert_s(x). Caches logits,
 // selection, gates, per-slot hidden activations, and per-slot pre-gate outputs
 // for the backward pass. Parallel over tokens (disjoint writes; deterministic).
+#endif /* !__wasm__ */
 void moe_ffn_forward(float* out, float* fch, float* fch_gelu,
                      float* router_logits, float* gates, float* expert_sel, float* expert_out,
                      const float* inp,
@@ -1013,6 +1036,8 @@ void moe_ffn_forward(float* out, float* fch, float* fch_gelu,
 // MoE FFN backward for one layer. Serial over tokens: different tokens may
 // select the same expert, so weight-gradient accumulation would race under OMP.
 // dinp accumulates (+=); weight grads accumulate into the zeroed grads buffers.
+// ---- host-only: the backward pass. A verifier only ever runs forward.
+#ifndef __wasm__
 void moe_ffn_backward(float* dinp,
                       float* dfcw, float* dfcb, float* dfcprojw, float* dfcprojb,
                       float* drouterw, float* drouterb,
@@ -1088,13 +1113,14 @@ void moe_ffn_backward(float* dinp,
     }
 }
 
+#endif /* !__wasm__ */
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     // targets are optional and could be NULL
 
     // ensure the model was initialized or error out
     if (model->params_memory == NULL) {
-        printf("Error: model was not initialized properly.\n");
-        exit(1);
+        BTMLOG("Error: model was not initialized properly.\n");
+        BTM_ABORT();
     }
 
     // convenience parameters (size_t to help prevent int overflow)
@@ -1106,9 +1132,9 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
 
     // validate inputs, all indices must be in the range [0, V)
     for(int i = 0; i < B * T; i++) {
-        assert(0 <= inputs[i] && inputs[i] < V);
+        BTM_ASSERT(0 <= inputs[i] && inputs[i] < V);
         if (targets != NULL) {
-            assert(0 <= targets[i] && targets[i] < V);
+            BTM_ASSERT(0 <= targets[i] && targets[i] < V);
         }
     }
 
@@ -1149,18 +1175,18 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             num_activations += model->act_sizes[i];
         }
-        printf("num_activations: %zu\n", num_activations);
+        BTMLOG("num_activations: %zu\n", num_activations);
         model->num_activations = num_activations;
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
         // also create memory for caching inputs and targets
-        model->inputs = (int*)mallocCheck(B * T * sizeof(int));
-        model->targets = (int*)mallocCheck(B * T * sizeof(int)); // might be unused if we never have targets but it's small
+        model->inputs = (int*)btm_alloc(B * T * sizeof(int));
+        model->targets = (int*)btm_alloc(B * T * sizeof(int)); // might be unused if we never have targets but it's small
     } else {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
         if (B != model->batch_size || T != model->seq_len) {
-            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, (int)B, (int)T);
-            exit(EXIT_FAILURE);
+            BTMLOG("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, (int)B, (int)T);
+            BTM_ABORT();
         }
     }
 
@@ -1250,6 +1276,10 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     }
 }
 
+// ---- host-only: zero_grad, backward and the AdamW update. Mining needs them; a
+// verifier does not, and dropping them removes the only float_control-sensitive
+// code a verifier would otherwise carry.
+#ifndef __wasm__
 void gpt2_zero_grad(GPT2 *model) {
     if(model->grads_memory != NULL) { memset(model->grads_memory, 0, model->num_parameters * sizeof(float)); }
     if(model->grads_acts_memory != NULL) { memset(model->grads_acts_memory, 0, model->num_activations * sizeof(float)); }
@@ -1259,8 +1289,8 @@ void gpt2_backward(GPT2 *model) {
 
     // double check we forwarded previously, with targets
     if (model->mean_loss == -1.0f) {
-        printf("Error: must forward with targets before backward\n");
-        exit(1);
+        BTMLOG("Error: must forward with targets before backward\n");
+        BTM_ABORT();
     }
 
     // lazily allocate the memory for gradients of the weights and activations, if needed
@@ -1374,7 +1404,7 @@ void gpt2_backward(GPT2 *model) {
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
     // reference: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
 
-    //printf("gpt2_update(): beta1=%.2e, beta2=%.2e, weight_decay=%.2e\n",beta1,beta2,weight_decay);
+    //BTMLOG("gpt2_update(): beta1=%.2e, beta2=%.2e, weight_decay=%.2e\n",beta1,beta2,weight_decay);
     
     // lazily allocate the memory for m_memory and v_memory
     if (model->m_memory == NULL) {
@@ -1396,7 +1426,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         float m_hat = m / (1.0f - powf(beta1, t));
         float v_hat = v / (1.0f - powf(beta2, t));
 
-	//printf("update param %lu (%.2e) with m_hat = %.2e (grad %.2e)\n",i,param,m_hat,grad);
+	//BTMLOG("update param %lu (%.2e) with m_hat = %.2e (grad %.2e)\n",i,param,m_hat,grad);
 
         // update
         model->m_memory[i] = m;
@@ -1405,17 +1435,18 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     }
 }
 
+#endif /* !__wasm__ */
 void gpt2_free(GPT2 *model) {
-    free(model->params_memory);
-    free(model->grads_memory);
-    free(model->m_memory);
-    free(model->v_memory);
-    free(model->acts_memory);
-    free(model->grads_acts_memory);
-    free(model->inputs);
-    free(model->targets);
-    free(model->active_weights);
-    free(model->params_memory_active);
+    btm_free(model->params_memory);
+    btm_free(model->grads_memory);
+    btm_free(model->m_memory);
+    btm_free(model->v_memory);
+    btm_free(model->acts_memory);
+    btm_free(model->grads_acts_memory);
+    btm_free(model->inputs);
+    btm_free(model->targets);
+    btm_free(model->active_weights);
+    btm_free(model->params_memory_active);
 }
 
 
@@ -1431,14 +1462,21 @@ void gpt2_free(GPT2 *model) {
 //! The caller passes the offset of the record being SCORED, so what comes back is the
 //! state that record is an improvement OVER -- see gpt2_eval_trunk for why the score is
 //! a difference. `cp_limit == cp_bytes` applies the whole chain.
-void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes, size_t cp_limit) {
-    if (cp_limit > cp_bytes) cp_limit = cp_bytes;
+//! The trunk's geometry and a zeroed parameter block. CONSENSUS: these six numbers plus
+//! MOE_E/MOE_K/MOE_H are what a record's framing is computed from, so a verifier that
+//! disagrees here cannot walk the chain at all.
+//!
+//! Returns the byte size of params_memory, or 0 if it could not be allocated -- which on
+//! wasm means the model does not fit under the node's memory cap, not that anything went
+//! wrong. Shared by the native file path and the on-chain fold path so the two cannot
+//! drift apart in geometry.
+static size_t gpt2_init_trunk_params(GPT2 *model) {
     model->config.num_layers = 12;
     model->config.channels = 768;
     model->config.num_heads = 12;
     model->config.max_seq_len = 1024;
-    model->config.vocab_size = 16384;
-    model->config.padded_vocab_size = 16384;
+    model->config.vocab_size = TRUNK_VOCAB;
+    model->config.padded_vocab_size = TRUNK_VOCAB;
 
     fill_in_parameter_sizes(model->param_sizes, model->config);
     model->num_parameters = 0;
@@ -1448,6 +1486,7 @@ void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes, size_t
         num_parameters_bytes += model->param_sizes[i] * sizeof(float);
     }
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes);
+    if (!model->params_memory) return 0;
     model->acts_memory = NULL;
     model->grads_memory = NULL;
     model->m_memory = NULL;
@@ -1461,6 +1500,13 @@ void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes, size_t
     model->active_weights = NULL;
     model->n_active_weights = 0;
     model->params_memory_active = NULL;
+    return num_parameters_bytes;
+}
+
+void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes, size_t cp_limit) {
+    if (cp_limit > cp_bytes) cp_limit = cp_bytes;
+    size_t num_parameters_bytes = gpt2_init_trunk_params(model);
+    if (num_parameters_bytes == 0) { BTMLOG("cannot allocate trunk parameters\n"); BTM_ABORT(); }
 
     size_t moe_offsets[BTMMOE_NUM_TENSORS];
     btmmoe_tensor_offsets(model->param_sizes, moe_offsets);
@@ -1468,10 +1514,17 @@ void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes, size_t
     // node-side weight-state cache (llmc/btmcache.h; NOT consensus): if the
     // cached tip matches a record head in the chain, resume from there instead
     // of re-deriving init + full replay.
-    const char* cache_path = "btm-trunk-state.bin";
-    unsigned char cache_tip[32];
+    //
+    // Absent on-chain, and not merely because there is no filesystem: a verifier must be
+    // a pure function of the chain, so it may not carry state between calls. The cache is
+    // the NATIVE harness's shortcut for re-scoring the same chain repeatedly, and the
+    // on-chain build simply rebuilds. What makes that affordable is the checkpoint, which
+    // bounds a rebuild to one epoch rather than the whole history.
     size_t start_off = 0;
     int need_init = 1;
+#ifndef __wasm__
+    const char* cache_path = "btm-trunk-state.bin";
+    unsigned char cache_tip[32];
     if (btmcache_load(cache_path, cache_tip, model->params_memory, model->num_parameters) == 0) {
         unsigned char gen[32];
         btmcache_genesis_tip(gen);
@@ -1490,19 +1543,22 @@ void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes, size_t
             }
         }
     }
+#endif /* !__wasm__ */
     if (need_init) {
-        printf("state cache miss: full rebuild\n");
+        BTMLOG("state cache miss: full rebuild\n");
         memset(model->params_memory, 0, num_parameters_bytes);
         btmmoe_init_base_params(model->params_memory, model->param_sizes, moe_offsets,
                                 12, 768, model->config.vocab_size, MOE_E, MOE_H, BTM2_BASE_SEED);
         start_off = 0;
     } else {
-        printf("state cache hit (resuming at chain offset %zu)\n", start_off);
+        BTMLOG("state cache hit (resuming at chain offset %zu)\n", start_off);
     }
 
     int applied_any = 0;
+#ifndef __wasm__
     unsigned char newtip[32];
     btmcache_genesis_tip(newtip);
+#endif
     size_t off = start_off;
     size_t last_head_off = (size_t)-1;
     {
@@ -1518,30 +1574,30 @@ void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes, size_t
     }
     while (off < cp_limit) {
         size_t rsz = btmmoe_record_size_h(cp + off, cp_limit - off, 768, MOE_H, MOE_E);
-        if (rsz == 0) { printf("error: malformed trunk chain record at offset %zu\n", off); exit(1); }
+        if (rsz == 0) { BTMLOG("error: malformed trunk chain record at offset %zu\n", off); BTM_ABORT(); }
         if (btmmoe_apply_record_h(model->params_memory, cp + off, rsz,
                                   12, 768, MOE_E, MOE_H, model->param_sizes, moe_offsets) != 0) {
-            printf("error: failed to apply trunk chain record at offset %zu\n", off); exit(1);
+            BTMLOG("error: failed to apply trunk chain record at offset %zu\n", off); BTM_ABORT();
         }
         applied_any = 1;
         off += rsz;
     }
+#ifndef __wasm__
     if (need_init || applied_any) {
         if (last_head_off != (size_t)-1) memcpy(newtip, cp + last_head_off, 32);
-#ifndef __wasm__
         // Never cache the state of a chain supplied by BTM_CHAIN. A candidate record's
         // folded state is not the real chain's, and the cache is keyed on the last
         // record's head -- writing it here poisons the next run, which is exactly the
         // aliasing that made the first compaction measurement report one file's loss for
         // another. Also keeps candidate scoring cheap: the base stays a cache hit.
         if (getenv("BTM_CHAIN")) {
-            printf("not caching state: scoring a BTM_CHAIN candidate\n");
-        } else
-#endif
-        if (btmcache_save(cache_path, newtip, model->params_memory, model->num_parameters) != 0) {
-            printf("warning: could not write state cache\n");
+            BTMLOG("not caching state: scoring a BTM_CHAIN candidate\n");
+        } else if (btmcache_save(cache_path, newtip, model->params_memory,
+                                 model->num_parameters) != 0) {
+            BTMLOG("warning: could not write state cache\n");
         }
     }
+#endif /* !__wasm__ */
 }
 
 //! Score the LAST record of `cp` by how much it IMPROVES the loss of the chain before it,
@@ -1562,75 +1618,71 @@ void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes, size_t
 //!
 //! `*ploss` gets the loss with the record applied, `*pbase_loss` the loss without it;
 //! the improvement is their difference, in that order.
-int gpt2_eval_trunk(float* ploss, float* pbase_loss, uchar* block_hash,
-                    uchar* cp, size_t cp_bytes, uint32_t nbits) {
-
-    GPT2 model;
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-
-    // The chain walk and the whole proof check come BEFORE any weights are built: they
-    // need no model, and a record with a bad proof should cost a verifier a few hashes
-    // rather than a full model build.
-    size_t off = 0;
-    size_t last_off = 0, last_size = 0;
-    size_t prev_off = (size_t)-1;
-    while (off < cp_bytes) {
-        size_t rsz = btmmoe_record_size_h(cp + off, cp_bytes - off, 768, MOE_H, MOE_E);
-        if (rsz == 0) { printf("error: malformed trunk chain record at offset %zu\n", off); return 1; }
-        if (off + rsz >= cp_bytes) { last_off = off; last_size = rsz; }
-        else { prev_off = off; }
-        off += rsz;
+//! Locate the candidate's corpus proof, check that it names the window its own deltas
+//! commit to and that the window really is in the committed corpus, and decode the
+//! window into next-token pairs. Returns 0 and fills vin/vtar; 1 means NO VALID SOLUTION.
+//!
+//! `prev_head` is the previous record's head, or the anchor hash for a chain's first
+//! record (0xff.. when there is no anchor either). Takes NO model on purpose: a bad proof
+//! should cost a verifier a few hashes rather than a 1.0 GiB build.
+//!
+//! Shared by the native harness and the on-chain verify(), so the two cannot drift on any
+//! rule that decides whether a record is a solution.
+static int btmv_proof_window(const uchar* rec, size_t rec_len, const uchar prev_head[32],
+                             int* vin, int* vtar) {
+    if (rec_len < BTM2_HEADER_BYTES) {
+        BTMLOG("no valid solution: record is shorter than its own header\n");
+        return 1;
     }
-    if (last_size == 0) { printf("error: no complete record in chain data\n"); return 1; }
 
-    uchar* preimage = (uchar*)mallocCheck(last_size);
-    memcpy(preimage, cp + last_off, last_size);
-    if (prev_off != (size_t)-1) memcpy(preimage, cp + prev_off, 32);
-    else if (block_hash) memcpy(preimage, block_hash, 32);
-    else memset(preimage, 255, 32);
-
-    uchar hash[32], hash2[32];
-    sha256_hash(preimage, last_size, hash);
-    sha256_hash(hash, 32, hash2);
-    printf("hash2 =");
-    for (int i = 0; i < 4; i++) printf(" %u", hash2[i]);
-    printf("\n");
-    if (memcmp(hash2, cp + last_off, 32) == 0) {
-        printf("chained hash matches the record head in the chain file\n");
-    } else {
-        printf("WARNING: chained hash does NOT match the record head (wrong block hash argument?)\n");
+    // The chaining preimage: this record with prev_head in place of its own head. The
+    // head must be the double-SHA256 of it, or the record is not bound to its content and
+    // the next record's prev_head is merely whatever this one asserts.
+    uchar* preimage = (uchar*)btm_alloc(rec_len);
+    if (!preimage) { BTMLOG("no valid solution: cannot allocate the preimage\n"); return 1; }
+    memcpy(preimage, rec, rec_len);
+    memcpy(preimage, prev_head, 32);
+    {
+        uchar h1[32], h2[32];
+        sha256_hash(preimage, rec_len, h1);
+        sha256_hash(h1, 32, h2);
+        if (memcmp(h2, rec, 32) != 0) {
+            BTMLOG("no valid solution: record head does not chain over prev_head\n");
+            btm_free(preimage);
+            return 1;
+        }
     }
 
     // --- the scored window comes from the record, not from a corpus on disk ----------
     //
-    // A wasm verifier has no filesystem, so it cannot hold a 10B-token corpus or load a
-    // dataloader batch. The record carries the window it was scored on plus a Merkle path
-    // to the root this module commits to; everything checked below arrives in the record,
-    // so verification needs no data availability at all (llmc/btmcorpus.h).
-    //
-    // Any failure here means NO VALID SOLUTION, never block invalidity -- same
-    // fall-through as malformed solution data.
+    // A wasm verifier has no filesystem, so it cannot hold a 10B-token corpus. The record
+    // carries the window it was scored on plus a Merkle path to the root this module
+    // commits to; everything checked here arrives in the record, so verification needs no
+    // data availability at all (llmc/btmcorpus.h).
     const unsigned char* proof = NULL;
-    size_t proof_len = 0, delta_len = 0;
+    size_t delta_len = 0;
     {
         uint16_t n_ent;
-        memcpy(&n_ent, cp + last_off + 32, 2);
-        const unsigned char* e = cp + last_off + BTM2_HEADER_BYTES;
-        size_t left = last_size - BTM2_HEADER_BYTES;
+        memcpy(&n_ent, rec + 32, 2);
+        const unsigned char* e = rec + BTM2_HEADER_BYTES;
+        size_t left = rec_len - BTM2_HEADER_BYTES;
         for (uint16_t i = 0; i < n_ent; i++) {
             size_t esz = btmmoe_entry_size_h(e, left, 768, MOE_H, MOE_E);
-            if (esz == 0 || esz > left) { printf("error: malformed entry %u\n", i); return 1; }
+            if (esz == 0 || esz > left) {
+                BTMLOG("no valid solution: malformed entry %u\n", i);
+                btm_free(preimage);
+                return 1;
+            }
             if (e[2] == BTM2_DELTA_CORPUS_PROOF) {
                 // Must be the LAST entry: the index is derived from the prefix ending
                 // here, so a proof anywhere else would be covered by its own input.
                 if (i + 1 != n_ent) {
-                    printf("no valid solution: corpus proof is entry %u of %u, not last\n",
+                    BTMLOG("no valid solution: corpus proof is entry %u of %u, not last\n",
                            i, n_ent);
+                    btm_free(preimage);
                     return 1;
                 }
                 proof = e;
-                proof_len = esz;
             } else {
                 delta_len += esz;
             }
@@ -1638,7 +1690,11 @@ int gpt2_eval_trunk(float* ploss, float* pbase_loss, uchar* block_hash,
             left -= esz;
         }
     }
-    if (!proof) { printf("no valid solution: record carries no corpus proof\n"); return 1; }
+    if (!proof) {
+        BTMLOG("no valid solution: record carries no corpus proof\n");
+        btm_free(preimage);
+        return 1;
+    }
 
     uint64_t claimed = 0;
     for (int i = 7; i >= 0; i--) claimed = (claimed << 8) | proof[4 + i];
@@ -1650,29 +1706,29 @@ int gpt2_eval_trunk(float* ploss, float* pbase_loss, uchar* block_hash,
     //    holds prev_head in its first 32 bytes, so the prefix is contiguous.
     uint64_t expect = btmc_leaf_index(preimage, BTM2_HEADER_BYTES + delta_len,
                                       BTM_CORPUS_N_LEAVES);
+    btm_free(preimage);
     if (claimed != expect) {
-        printf("no valid solution: proof names leaf %llu, deltas commit to %llu\n",
+        BTMLOG("no valid solution: proof names leaf %llu, deltas commit to %llu\n",
                (unsigned long long)claimed, (unsigned long long)expect);
         return 1;
     }
     // 2. the window must really be in the committed corpus.
     {
         unsigned char want[32], got[32];
-        const char* hx = BTM_CORPUS_ROOT_HEX;
-        for (int i = 0; i < 32; i++) {
-            unsigned v; sscanf(hx + 2 * i, "%2x", &v); want[i] = (unsigned char)v;
+        if (btm_unhex(BTM_CORPUS_ROOT_HEX, want, 32) != 0) {
+            BTMLOG("no valid solution: BTM_CORPUS_ROOT_HEX is not 64 hex digits\n");
+            return 1;
         }
         int rc = btmc_fold(claimed, BTM_CORPUS_N_LEAVES, leaf, sibs, n_sibs, got);
         if (rc != 0 || memcmp(got, want, 32) != 0) {
-            printf("no valid solution: corpus proof does not fold to the root (rc=%d)\n", rc);
+            BTMLOG("no valid solution: corpus proof does not fold to the root (rc=%d)\n", rc);
             return 1;
         }
     }
-    printf("corpus proof ok: leaf %llu of %llu, depth %d\n",
+    BTMLOG("corpus proof ok: leaf %llu of %llu, depth %d\n",
            (unsigned long long)claimed, (unsigned long long)BTM_CORPUS_N_LEAVES, n_sibs);
 
     // The window, as next-token pairs: a 64-token leaf scores 63 predictions.
-    int vin[BTM_CORPUS_SCORE_T], vtar[BTM_CORPUS_SCORE_T];
     for (int j = 0; j < BTM_CORPUS_SCORE_T; j++) {
         uint16_t a, b;
         memcpy(&a, leaf + 2 * j, 2);
@@ -1680,33 +1736,42 @@ int gpt2_eval_trunk(float* ploss, float* pbase_loss, uchar* block_hash,
         vin[j] = (int)a;
         vtar[j] = (int)b;
     }
-    printf("inputs:");
-    for (int j = 0; j < BTM_CORPUS_SCORE_T; j++) printf(" %d", vin[j]);
-    printf("\n");
+    // The tokens are uint16 out of the record, so they can name an id the model has no
+    // embedding for -- 65535 against a vocab of 16384. The proof must fold to the
+    // committed root, so in practice they are the real corpus's and all in range; this is
+    // the defence in depth, and it turns what would otherwise be a trap deep in
+    // gpt2_forward's index check into an ordinary "no valid solution".
+    for (int j = 0; j < BTM_CORPUS_SCORE_T; j++) {
+        if (vin[j] >= TRUNK_VOCAB || vtar[j] >= TRUNK_VOCAB) {
+            BTMLOG("no valid solution: window token %d out of vocab range (%d >= %d)\n",
+                   j, vin[j] > vtar[j] ? vin[j] : vtar[j], TRUNK_VOCAB);
+            return 1;
+        }
+    }
+    BTMLOG("inputs:");
+    for (int j = 0; j < BTM_CORPUS_SCORE_T; j++) BTMLOG(" %d", vin[j]);
+    BTMLOG("\n");
+    return 0;
+}
 
-    // --- the baseline: the chain WITHOUT this record ---------------------------------
-    //
-    // `last_off` is where the scored record begins, so the build stops just short of it.
-    // For the first record of a chain last_off is 0 and the baseline is the bare
-    // fixed-seed init, which is the correct thing to improve on.
-    gpt2_build_from_chain_trunk(&model, cp, cp_bytes, last_off);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    printf("model build took %.3f s\n", (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);
+//! Score `rec` against the base state already held in `model`: one forward on the window,
+//! the record applied, a second forward on the SAME window, then the gate.
+//! Returns 0 if the record is a valid solution, 1 if it is not. `*pbase` and `*pval` are
+//! written before the gate runs, so a rejected record still yields its numbers.
+static int btmv_score(GPT2* model, const uchar* rec, size_t rec_len,
+                      const int* vin, const int* vtar, uint32_t nbits, float gate_g,
+                      float* pbase, float* pval) {
+    gpt2_forward(model, (int*)vin, (int*)vtar, 1, BTM_CORPUS_SCORE_T);
+    float base_loss = model->mean_loss;
+    BTMLOG("base loss %f\n", base_loss);
 
-    gpt2_forward(&model, vin, vtar, 1, BTM_CORPUS_SCORE_T);
-    float base_loss = model.mean_loss;
-    printf("base loss %f\n", base_loss);
-
-    // --- apply the scored record and measure the same window again -------------------
     {
         size_t moe_offsets[BTMMOE_NUM_TENSORS];
-        btmmoe_tensor_offsets(model.param_sizes, moe_offsets);
-        if (btmmoe_apply_record_h(model.params_memory, cp + last_off, last_size,
-                                  12, 768, MOE_E, MOE_H, model.param_sizes,
+        btmmoe_tensor_offsets(model->param_sizes, moe_offsets);
+        if (btmmoe_apply_record_h(model->params_memory, rec, rec_len,
+                                  12, 768, MOE_E, MOE_H, model->param_sizes,
                                   moe_offsets) != 0) {
-            printf("no valid solution: cannot apply the scored record\n");
-            gpt2_free(&model);
-            free(preimage);
+            BTMLOG("no valid solution: cannot apply the scored record\n");
             return 1;
         }
     }
@@ -1727,74 +1792,114 @@ int gpt2_eval_trunk(float* ploss, float* pbase_loss, uchar* block_hash,
     // slow verifier but a solution scored INVALID. Those counts are estimated from FLOPs,
     // not measured; contrib/dynamicalgo/aot_harness runs the module under the node's own
     // instrumentation and is what should settle them before this ships.
-    gpt2_forward(&model, vin, vtar, 1, BTM_CORPUS_SCORE_T);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    printf("two forwards took %.3f s\n", (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);
-    float val_loss = model.mean_loss;
-    printf("val loss %f\n", val_loss);
+    gpt2_forward(model, (int*)vin, (int*)vtar, 1, BTM_CORPUS_SCORE_T);
+    float val_loss = model->mean_loss;
+    BTMLOG("val loss %f\n", val_loss);
     uint32_t loss_bits;
     memcpy(&loss_bits, &val_loss, 4);
-    printf("val loss bits = %08x\n", loss_bits);
+    BTMLOG("val loss bits = %08x\n", loss_bits);
 
     // THE SCORE. Exact in IEEE: both operands are f32 and the subtraction is a single
     // rounded operation, so every verifier that agrees on the two losses agrees on this.
     float improvement = base_loss - val_loss;
     uint32_t imp_bits;
     memcpy(&imp_bits, &improvement, 4);
-    printf("improvement %+.8f\n", improvement);
-    printf("improvement bits = %08x\n", imp_bits);
+    BTMLOG("improvement %+.8f\n", improvement);
+    BTMLOG("improvement bits = %08x\n", imp_bits);
 
-    // Reported before the gate so a rejected record still yields its numbers: the caller
-    // prints them, and a miner needs to see how far short it fell.
-    *ploss = val_loss;
-    if (pbase_loss) *pbase_loss = base_loss;
+    if (pval) *pval = val_loss;
+    if (pbase) *pbase = base_loss;
 
     // --- THE GATE (llmc/btmmoe.h) ----------------------------------------------------
     // Failing it means NO VALID SOLUTION -- the same fall-through as a malformed record
     // or a proof that does not fold. It never makes the containing block invalid.
     {
         float scale = btmmoe_difficulty_scale(BTM_GATE_NBITS_0, nbits);
-        float required = btmmoe_gate_required(base_loss, nbits);
+        float required = btmmoe_gate_required_g(base_loss, nbits, gate_g);
         uint32_t req_bits;
         memcpy(&req_bits, &required, 4);
-        printf("gate requires %+.8f (base %f / %d, difficulty scale %g from nbits %08x"
-               " vs D0 %08x), bits = %08x\n",
-               required, base_loss, 1 << BTM_GATE_SHIFT, (double)scale,
+        BTMLOG("gate requires %+.8f (base %f * g %.9g, difficulty scale %g from nbits"
+               " %08x vs D0 %08x), bits = %08x\n",
+               required, base_loss, (double)gate_g, (double)scale,
                nbits, (unsigned)BTM_GATE_NBITS_0, req_bits);
-        if (!btmmoe_gate_passes(base_loss, val_loss, nbits)) {
-            printf("no valid solution: improvement %+.8f is below the required %+.8f\n",
+        if (!btmmoe_gate_passes_g(base_loss, val_loss, nbits, gate_g)) {
+            BTMLOG("no valid solution: improvement %+.8f is below the required %+.8f\n",
                    improvement, required);
-            gpt2_free(&model);
-            free(preimage);
             return 1;
         }
-        printf("gate passed: improvement %+.8f >= %+.8f\n", improvement, required);
+        BTMLOG("gate passed: improvement %+.8f >= %+.8f\n", improvement, required);
     }
-
-    gpt2_free(&model);
-    free(preimage);
     return 0;
 }
 
+//! Native harness: score the LAST record of a flat chain buffer. The on-chain path is
+//! verify(), which takes the candidate from the block's solution and the base state from
+//! the chain imports; both share btmv_proof_window and btmv_score, so neither can drift
+//! on a rule that decides validity.
+int gpt2_eval_trunk(float* ploss, float* pbase_loss, uchar* block_hash,
+                    uchar* cp, size_t cp_bytes, uint32_t nbits) {
+    GPT2 model;
+    BTM_TIMER(t0, t1);
+    BTM_TICK(t0);
+
+    size_t off = 0, last_off = 0, last_size = 0, prev_off = (size_t)-1;
+    while (off < cp_bytes) {
+        size_t rsz = btmmoe_record_size_h(cp + off, cp_bytes - off, 768, MOE_H, MOE_E);
+        if (rsz == 0) { BTMLOG("error: malformed trunk chain record at offset %zu\n", off); return 1; }
+        if (off + rsz >= cp_bytes) { last_off = off; last_size = rsz; }
+        else { prev_off = off; }
+        off += rsz;
+    }
+    if (last_size == 0) { BTMLOG("error: no complete record in chain data\n"); return 1; }
+
+    uchar prev_head[32];
+    if (prev_off != (size_t)-1) memcpy(prev_head, cp + prev_off, 32);
+    else if (block_hash) memcpy(prev_head, block_hash, 32);
+    else memset(prev_head, 255, 32);
+
+    int vin[BTM_CORPUS_SCORE_T], vtar[BTM_CORPUS_SCORE_T];
+    if (btmv_proof_window(cp + last_off, last_size, prev_head, vin, vtar) != 0) return 1;
+
+    // The baseline is the chain WITHOUT this record: `last_off` is where it begins, so the
+    // build stops just short of it. For a chain's first record that is 0 and the baseline
+    // is the bare fixed-seed init, which is the correct thing to improve on.
+    gpt2_build_from_chain_trunk(&model, cp, cp_bytes, last_off);
+    BTM_TICK(t1);
+    BTMLOG("model build took %.3f s\n", BTM_ELAPSED(t0, t1));
+
+    // BTM_GATE_FRACTION, not a retargeted g: a flat chain file carries no verdict
+    // history. Every record in it is one a verifier accepted, so counting would give
+    // V == W and the HARDEST possible gate, which is the wrong answer for a dev harness.
+    // The on-chain path reads real verdicts and retargets; see verify().
+    int r = btmv_score(&model, cp + last_off, last_size, vin, vtar, nbits,
+                       BTM_GATE_FRACTION, pbase_loss, ploss);
+    BTM_TICK(t1);
+    BTMLOG("two forwards took %.3f s\n", BTM_ELAPSED(t0, t1));
+    gpt2_free(&model);
+    return r;
+}
+
+// ---- host-only: the native harness. On-chain the entry point is verify(), below.
+#ifndef __wasm__
 int main(int argc, char** argv) {
 
-    assert(CHAR_BIT == 8);
-    assert(sizeof(float) == 4);
-    assert(sizeof(unsigned int) == 4);
+    BTM_ASSERT(CHAR_BIT == 8);
+    BTM_ASSERT(sizeof(float) == 4);
+    BTM_ASSERT(sizeof(unsigned int) == 4);
     const int one = 1;
-    assert( (*(const char*)&one) != 0 ); // little endian
+    BTM_ASSERT( (*(const char*)&one) != 0 ); // little endian
 
     uchar* block_hash = 0;
     if (argc > 1) {
         size_t len = hex_to_uchar(&block_hash, argv[1]);
         if (len > 0) {
             if (len != 32) {
-                printf("block hash length must be 32 bytes (length 64 hex string)\n");
-                exit(1);
+                BTMLOG("block hash length must be 32 bytes (length 64 hex string)\n");
+                BTM_ABORT();
             }
-            printf("have block_hash =");
-            for (int i = 0; i < 32; i++) printf(" %02x", block_hash[i]);
-            printf("\n");
+            BTMLOG("have block_hash =");
+            for (int i = 0; i < 32; i++) BTMLOG(" %02x", block_hash[i]);
+            BTMLOG("\n");
         }
     }
 
@@ -1812,19 +1917,19 @@ int main(int argc, char** argv) {
         const char* alt = getenv("BTM_CHAIN");
         if (alt && *alt) {
             cpfname = alt;
-            printf("DIAGNOSTIC: reading chain from %s (BTM_CHAIN)\n", cpfname);
+            BTMLOG("DIAGNOSTIC: reading chain from %s (BTM_CHAIN)\n", cpfname);
         }
     }
 #endif
     FILE* cpf = fopen(cpfname, "rb");
-    if (!cpf) { printf("error: cannot open %s\n", cpfname); exit(1); }
+    if (!cpf) { BTMLOG("error: cannot open %s\n", cpfname); BTM_ABORT(); }
     fseekCheck(cpf, 0L, SEEK_END);
     size_t cp_bytes = (size_t)ftell(cpf);
     fseekCheck(cpf, 0L, SEEK_SET);
-    uchar* cp = (uchar*)mallocCheck(cp_bytes);
+    uchar* cp = (uchar*)btm_alloc(cp_bytes);
     freadCheck(cp, 1, cp_bytes, cpf);
     fcloseCheck(cpf);
-    printf("cp_bytes = %zu\n", cp_bytes);
+    BTMLOG("cp_bytes = %zu\n", cp_bytes);
 
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1840,10 +1945,146 @@ int main(int argc, char** argv) {
     int ret = gpt2_eval_trunk(&loss, &base_loss, block_hash, cp, cp_bytes, nbits);
     clock_gettime(CLOCK_MONOTONIC, &end);
     double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-    printf("eval took %.3f s (base %f, loss %f, improvement %+.8f)\n",
+    BTMLOG("eval took %.3f s (base %f, loss %f, improvement %+.8f)\n",
            time_elapsed_s, base_loss, loss, base_loss - loss);
 
-    free(cp);
-    if (block_hash) free(block_hash);
+    btm_free(cp);
+    if (block_hash) btm_free(block_hash);
     return ret;
 }
+
+#endif /* !__wasm__ */
+#ifdef __wasm__
+// ----------------------------------------------------------------------------
+// On-chain entry point.
+//
+// The node calls verify() with the block's solution bytes as `nonce`; the base state
+// comes from the slot's earlier approved records via the chain imports. Nothing here
+// touches a filesystem, and the module imports nothing but chain.*.
+//
+// defines: the chain source and its fold-and-discard iterator
+#include "llmc/btmchain.h"
+
+//! Largest solution this verifier will accept. A record at E=32 is 593,583 bytes, and
+//! MAX_SOLUTION_TX_WEIGHT caps a block's solution payload near 975 KB regardless, so a
+//! megabyte is comfortable while still refusing anything absurd before allocating.
+#define BTMV_RECORD_MAX (1u << 20)
+
+static void btmv_put_u32le(unsigned char* p, uint32_t v) {
+    p[0] = (unsigned char)v;         p[1] = (unsigned char)(v >> 8);
+    p[2] = (unsigned char)(v >> 16); p[3] = (unsigned char)(v >> 24);
+}
+
+//! alpha and beta as Q32 fixed point, both 0.5, matching contrib/dynamicalgo's reference
+//! algos. CONSTANT, and written on EVERY path -- the early returns and the node's
+//! empty-solution probe for the no-solution branch included. A solution-dependent alpha
+//! would nullify the inclusion incentive: the native miner would be paid the same whether
+//! or not it included a solution that arrived in its mempool.
+static void btmv_put_ab(unsigned char* out_ab) {
+    btmv_put_u32le(out_ab,     0x80000000u);
+    btmv_put_u32le(out_ab + 4, 0x80000000u);
+}
+
+typedef struct {
+    GPT2* model;
+    size_t* moe;
+    int err;
+} btmv_fold_ctx;
+
+static int btmv_fold_one(const unsigned char* rec, size_t len, void* c) {
+    btmv_fold_ctx* f = (btmv_fold_ctx*)c;
+    if (btmmoe_apply_record_h(f->model->params_memory, rec, len, 12, 768, MOE_E, MOE_H,
+                              f->model->param_sizes, f->moe) != 0) {
+        f->err = 1;
+        return -1;
+    }
+    return 0;
+}
+
+//! The newest APPROVED record's head, which is the candidate's prev_head. Scans down from
+//! index 0 -- the newest slot block -- until a block yields a solution; blocks whose
+//! verdict was not valid return 0 and are skipped, exactly as the fold skips them.
+//!
+//! Fetched before the fold on purpose. It costs one extra I/O call and one record's bytes,
+//! and it buys back the property that a record with a bad proof is rejected for a few
+//! hashes instead of a 1.0 GiB build plus a whole-chain fold.
+static int btmv_prev_head(const btmchain* ch, unsigned char* buf, size_t cap,
+                          unsigned char out[32]) {
+    int n = btmchain_count(ch);
+    for (int i = 0; i < n; i++) {
+        int sz = btmchain_solution(ch, i, buf, cap);
+        if (sz > 0) {
+            if (sz < 32) return 0;      /* too short to carry a head: not a record */
+            memcpy(out, buf, 32);
+            return 1;
+        }
+        if (sz < 0 && sz != BTMCHAIN_NO_BLOCK) return -1;
+    }
+    return 0;                            /* no approved record yet: a genesis candidate */
+}
+
+__attribute__((export_name("verify")))
+int verify(const unsigned char* anchor_hash,
+           const unsigned char* payout, uint32_t payout_len,
+           uint32_t nbits,
+           const unsigned char* nonce, uint32_t nonce_len,
+           unsigned char* out_ab)
+{
+    btmv_put_ab(out_ab);                 /* on every path, before anything can fail */
+
+    // The payout is bound by the solution's own seq=0 chunk and by the seed the node
+    // derives from it; this algo does not hash it, so the record is the same whoever is
+    // being paid. Named rather than silently ignored.
+    (void)payout; (void)payout_len;
+
+    if (nonce_len == 0 || nonce_len > BTMV_RECORD_MAX) return 1;
+
+    btmchain ch;
+    if (btmchain_open(&ch) != 0) return 1;
+
+    unsigned char* buf = (unsigned char*)btm_alloc(BTMV_RECORD_MAX);
+    if (!buf) return 1;
+
+    unsigned char prev_head[32];
+    int ph = btmv_prev_head(&ch, buf, BTMV_RECORD_MAX, prev_head);
+    if (ph < 0) return 1;
+    if (ph == 0) memcpy(prev_head, anchor_hash, 32);   /* first record of the chain */
+
+    // Proof first, model second: everything btmv_proof_window checks is in the record.
+    int vin[BTM_CORPUS_SCORE_T], vtar[BTM_CORPUS_SCORE_T];
+    if (btmv_proof_window(nonce, nonce_len, prev_head, vin, vtar) != 0) return 1;
+
+    // The base state: the fixed-seed init with every approved record folded in. Records
+    // arrive one at a time and are discarded after being applied, because the state
+    // (1.0 GiB) dwarfs anything a block can carry.
+    GPT2 model;
+    size_t nb = gpt2_init_trunk_params(&model);
+    if (nb == 0) return 1;               /* does not fit under WASM_MAX_MEMORY_PAGES */
+    size_t moe_offsets[BTMMOE_NUM_TENSORS];
+    btmmoe_tensor_offsets(model.param_sizes, moe_offsets);
+    memset(model.params_memory, 0, nb);
+    btmmoe_init_base_params(model.params_memory, model.param_sizes, moe_offsets,
+                            12, 768, model.config.vocab_size, MOE_E, MOE_H, BTM2_BASE_SEED);
+
+#ifdef BTMV_MEASURE_INIT_ONLY
+    // MEASUREMENT BUILDS ONLY: stop after the base init so its gas cost can be separated
+    // from the fold and the two forwards. Never build the deployed module with this.
+    return 1;
+#endif
+    btmv_fold_ctx fc;
+    fc.model = &model; fc.moe = moe_offsets; fc.err = 0;
+    if (btmchain_fold(&ch, 0, buf, BTMV_RECORD_MAX, btmv_fold_one, &fc) < 0 || fc.err)
+        return 1;
+
+    // The gate's difficulty, from how many of the last BTM_GATE_WINDOW slot blocks
+    // carried a valid solution. One I/O call per probe and zero bytes, which is why the
+    // rule counts verdicts rather than timing blocks.
+    uint32_t window = 0;
+    uint32_t valid = btmchain_count_valid(&ch, BTM_GATE_WINDOW, &window);
+    float gate_g = btmmoe_gate_fraction(valid, window);
+
+    float base_loss = 0.0f, val_loss = 0.0f;
+    return btmv_score(&model, nonce, nonce_len, vin, vtar, nbits, gate_g,
+                      &base_loss, &val_loss);
+}
+#endif /* __wasm__ */

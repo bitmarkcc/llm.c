@@ -36,6 +36,7 @@ Record entry types added to btmrecord.h's 0 (sparse overwrite) and 1 (LoRA):
 #define BTMMOE_H
 
 #include "btmrecord.h"
+#include "btmhost.h"   /* btm_alloc: malloc natively, memory.grow on wasm */
 #include "btmcorpus.h"
 
 #define BTM2_DELTA_LORA_EXPERT 2
@@ -289,17 +290,25 @@ static inline float btmmoe_difficulty_scale(uint32_t nbits0, uint32_t nbits) {
 //! zero requirement would admit a record that changes nothing -- or, with the >= test,
 //! one that makes the model worse by nothing at all. A record must improve the model to
 //! be a solution, at any difficulty; that is the floor the scaling may not erode.
-static inline int btmmoe_gate_passes(float base_loss, float val_loss, uint32_t nbits) {
+//! The requirement, given a gate fraction `g`. `g` is BTM_GATE_FRACTION when no verdict
+//! history is available and btmmoe_gate_fraction(V, W) when it is.
+static inline float btmmoe_gate_required_g(float base_loss, uint32_t nbits, float g) {
+    return base_loss * g * btmmoe_difficulty_scale(BTM_GATE_NBITS_0, nbits);
+}
+
+static inline int btmmoe_gate_passes_g(float base_loss, float val_loss, uint32_t nbits,
+                                       float g) {
     float improvement = base_loss - val_loss;
-    float required = base_loss * BTM_GATE_FRACTION
-                   * btmmoe_difficulty_scale(BTM_GATE_NBITS_0, nbits);
+    float required = btmmoe_gate_required_g(base_loss, nbits, g);
     return improvement > 0.0f && improvement >= required;
 }
 
-//! The requirement itself, for reporting.
+//! The unretargeted forms, at the base fraction. Used where no verdict history exists.
+static inline int btmmoe_gate_passes(float base_loss, float val_loss, uint32_t nbits) {
+    return btmmoe_gate_passes_g(base_loss, val_loss, nbits, BTM_GATE_FRACTION);
+}
 static inline float btmmoe_gate_required(float base_loss, uint32_t nbits) {
-    return base_loss * BTM_GATE_FRACTION
-         * btmmoe_difficulty_scale(BTM_GATE_NBITS_0, nbits);
+    return btmmoe_gate_required_g(base_loss, nbits, BTM_GATE_FRACTION);
 }
 
 // fill the 18 MoE parameter tensor sizes (Vp = padded vocab)
@@ -703,9 +712,11 @@ static inline void btmmoe_init_base_params(float* params, const size_t* param_si
         size_t n = param_sizes[t];
         if (t == 0) n = (size_t)V * C; // init V rows of wte, not Vp
         float scale = (t == 6 || t == 12) ? 0.02f * rs : 0.02f;
-        float* buf = (float*)malloc(n * sizeof(float));
-        normal_(buf, (unsigned int)n, 0.0f, scale, &rng);
-        memcpy(params + tensor_offsets[t], buf, n * sizeof(float));
-        free(buf);
+        // Written STRAIGHT into params: normal_fill works in place, so the result is
+        // bit-identical to filling a temp and copying. The temp was not free either --
+        // fcw and fcprojw are 113M floats each, so at E=32 the staging buffers came to
+        // ~1.05 GiB on top of the 1.0 GiB of params, which overran the verifier's
+        // 1.984 GiB memory cap outright.
+        normal_(params + tensor_offsets[t], (unsigned int)n, 0.0f, scale, &rng);
     }
 }

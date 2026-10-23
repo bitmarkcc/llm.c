@@ -75,8 +75,22 @@ extern int chain_slot_block_count(void);
 __attribute__((import_module("chain"), import_name("slot_block_solution_valid")))
 extern int chain_slot_block_solution_valid(int index);
 
+#ifdef BTMCHAIN_STUB_SOLUTION
+/* MEASUREMENT BUILDS ONLY. The node does not register chain.slot_block_solution yet, so a
+ * module importing it cannot be instantiated -- which blocks measuring gas under the
+ * node's own instrumentation (contrib/dynamicalgo/gasinstrument + aot_harness). Defining
+ * it locally as "no solution here" reports an empty chain, which exercises the genesis
+ * path: proof check, model build, two forwards, gate. That is the whole instruction-gas
+ * cost; folding contributes I/O gas only, and with an empty chain there is none to fold.
+ * NEVER build the deployed module with this. */
+static int chain_slot_block_solution(int index, void* ptr, int cap) {
+    (void)index; (void)ptr; (void)cap;
+    return 0;
+}
+#else
 __attribute__((import_module("chain"), import_name("slot_block_solution")))
 extern int chain_slot_block_solution(int index, void* ptr, int cap);
+#endif
 
 typedef struct { int n; } btmchain;
 

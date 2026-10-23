@@ -318,6 +318,40 @@ eval_gpt2_btm_trunk_f32.wasm: eval_gpt2_btm_trunk_f32.c
 eval_gpt2_btm_trunk_f32_simd.wasm: eval_gpt2_btm_trunk_f32.c
 	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 -msimd128 $^ -o $@ -nodefaultlibs -lc $(WASI_BUILTINS)
 
+# The ON-CHAIN module: exports verify(), imports nothing but chain.*.
+#
+# Differs from the .wasm targets above in two flags, and both are load-bearing:
+#   -nostartfiles   omits crt1-command.o. Without it the WASI startup object is linked
+#                   even with --no-entry, and it drags in __main_void -> args_get,
+#                   _Exit -> proc_exit and dlmalloc -> sbrk -> abort. That alone is the
+#                   difference between 3 WASI imports and 0.
+#   --no-entry      no _start; the node calls the exported verify() directly.
+# -lc stays: static linking is per OBJECT, so with no stdio/file/env/time calls in the
+# source the only members pulled in are the math ones (expf, logf, sinf, cosf, tanhf),
+# which are pure computation and import nothing. Keeping them IN the module is also what
+# makes them deterministic across nodes.
+#
+# Verify after building, because a stray import is silent until the node refuses to
+# instantiate:
+#   strings -a eval_gpt2_btm_trunk_f32_algo.wasm | grep -c __imported_wasi   # must be 0
+# -msimd128 is NOT optional here. The gas limits are per opcode CLASS: a scalar build
+# charges each multiply-accumulate to GC_FADD, whose cap is 512M, and one forward over 63
+# tokens is ~4.38e9 of them -- an order of magnitude over. The SIMD128 path charges
+# GC_SIMD instead (cap 5e9) at four lanes per op. The kernel is written so both produce
+# bit-identical results (see btmk_dot), so this is a gas decision, not a numerics one.
+eval_gpt2_btm_trunk_f32_algo.wasm: eval_gpt2_btm_trunk_f32.c
+	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 -msimd128 $^ -o $@ \
+	    -nodefaultlibs -nostartfiles -lc $(WASI_BUILTINS) \
+	    -Wl,--no-entry -Wl,--export=verify
+	@n=$$(strings -a $@ | grep -c __imported_wasi || true); \
+	 if [ "$$n" != "0" ]; then \
+	   echo "ERROR: $@ has $$n WASI imports; the node provides none and will refuse it:"; \
+	   strings -a $@ | grep __imported_wasi | sed 's/.*preview1_/  /' | sort -u; \
+	   rm -f $@; exit 1; \
+	 fi; \
+	 echo "$@: 0 WASI imports; chain imports:"; \
+	 strings -a $@ | grep -E '^slot_block' | sort -u | sed 's/^/  chain./' 
+
 test_gpt2: test_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
 

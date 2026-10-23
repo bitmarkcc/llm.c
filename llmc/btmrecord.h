@@ -39,6 +39,7 @@ seed BTM2_BASE_SEED -- deterministic given llmc/rand.h; part of consensus.
 #define BTMRECORD_H
 
 #include <stdint.h>
+#include "btmhost.h"   /* btm_alloc: malloc natively, memory.grow on wasm */
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -300,10 +301,10 @@ static inline void btm2_init_base_params(float* params, const size_t* param_size
                     layer_offset = l * n;
                 }
                 float scale = (i == 6 || i == 12) ? 0.02f * residual_scale : 0.02f;
-                float* buf = (float*)malloc(n * sizeof(float));
-                normal_(buf, (unsigned int)n, 0.0f, scale, &init_rng);
-                memcpy(params + offset + layer_offset, buf, n * sizeof(float));
-                free(buf);
+                // Straight into params; see btmmoe_init_base_params for why the temp
+                // buffer had to go. normal_fill is in-place, so this is bit-identical.
+                normal_(params + offset + layer_offset, (unsigned int)n, 0.0f, scale,
+                        &init_rng);
             }
             offset += param_sizes[i];
         }

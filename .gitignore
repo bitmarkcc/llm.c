@@ -73,3 +73,5 @@ corpus_leaves.bin
 corpus_tree.bin
 dev/btm_corpus_check
 *.bin.bak
+
+eval_gpt2_btm_trunk_f32_algo.wasm
