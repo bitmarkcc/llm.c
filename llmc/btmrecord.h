@@ -39,6 +39,16 @@ seed BTM2_BASE_SEED -- deterministic given llmc/rand.h; part of consensus.
 #define BTMRECORD_H
 
 #include <stdint.h>
+#ifdef __wasm_simd128__
+#include <wasm_simd128.h>
+//! Four int8 at `p` SIGN-extended into an i32x4. load32_zero brings in exactly the four
+//! bytes; the two extend_low steps sign-extend 8->16->32, which is what int8 requires.
+static inline v128_t btm2_i8x4_to_i32x4(const int8_t* p) {
+    v128_t v = wasm_v128_load32_zero((const void*)p);
+    v = wasm_i16x8_extend_low_i8x16(v);
+    return wasm_i32x4_extend_low_i16x8(v);
+}
+#endif
 #include "btmhost.h"   /* btm_alloc: malloc natively, memory.grow on wasm */
 #include <stddef.h>
 #include <stdlib.h>
@@ -178,6 +188,104 @@ static inline void btm2_apply_lora_int8(float* W, int out, int in, int r,
                                         uint16_t sA_bits, uint16_t sB_bits) {
     if (sA_bits == 0 || sB_bits == 0) return; // zero delta
     float s = btm2_half_to_float(sA_bits) * btm2_half_to_float(sB_bits);
+#ifdef __wasm_simd128__
+    /* Vectorised ACROSS ic -- across independent output weights, never across the j
+     * reduction -- so each weight sees the identical sequence of operations it saw
+     * scalar. acc is int32 and every product fits (|int8*int8| <= 16384, times r), so the
+     * integer arithmetic is exact regardless of order; the final convert, scale and
+     * accumulate are per-lane f32 ops identical to the scalar path. Bit-exactness is
+     * therefore structural, and it is checked end to end by running the WASI build under
+     * wasmtime and comparing loss bits against native.
+     *
+     * This exists for GAS. Measured under the node's own instrumentation, applying one
+     * record was 598M scalar MEM ops -- 82% of scoring's total and 227% of the MEM cap on
+     * its own -- at ~12 per touched weight across 50,135,040 weights. The identifying
+     * detail was FCVT: 49.84M, one (float)acc per weight to three digits. Vectorised, a
+     * group of four weights costs r+2 v128 loads/stores and no scalar memory traffic. */
+    const v128_t vs = wasm_f32x4_splat(s);
+    for (int oc = 0; oc < out; oc++) {
+        const int8_t* Arow = A + (size_t)oc * r;
+        float* Wrow = W + (size_t)oc * in;
+        int ic = 0;
+        if (r == 4) {
+            /* r == 4 is what the miner emits. Hoisting A matters: Arow[j] is invariant
+             * across ic, but with a runtime r the compiler cannot unroll j to see it, and
+             * reloading it per weight is one scalar load per weight -- 50M of them. */
+            const v128_t a0 = wasm_i32x4_splat((int32_t)Arow[0]);
+            const v128_t a1 = wasm_i32x4_splat((int32_t)Arow[1]);
+            const v128_t a2 = wasm_i32x4_splat((int32_t)Arow[2]);
+            const v128_t a3 = wasm_i32x4_splat((int32_t)Arow[3]);
+            const int8_t* B0 = B;
+            const int8_t* B1 = B + (size_t)in;
+            const int8_t* B2 = B + (size_t)2 * in;
+            const int8_t* B3 = B + (size_t)3 * in;
+            for (; ic + 4 <= in; ic += 4) {
+                v128_t acc =                  wasm_i32x4_mul(a0, btm2_i8x4_to_i32x4(B0 + ic));
+                acc = wasm_i32x4_add(acc,     wasm_i32x4_mul(a1, btm2_i8x4_to_i32x4(B1 + ic)));
+                acc = wasm_i32x4_add(acc,     wasm_i32x4_mul(a2, btm2_i8x4_to_i32x4(B2 + ic)));
+                acc = wasm_i32x4_add(acc,     wasm_i32x4_mul(a3, btm2_i8x4_to_i32x4(B3 + ic)));
+                v128_t d = wasm_f32x4_mul(wasm_f32x4_convert_i32x4(acc), vs);
+                wasm_v128_store(Wrow + ic, wasm_f32x4_add(wasm_v128_load(Wrow + ic), d));
+            }
+        }
+        for (; ic + 4 <= in; ic += 4) {           /* any other r */
+            v128_t acc = wasm_i32x4_splat(0);
+            for (int j = 0; j < r; j++) {
+                acc = wasm_i32x4_add(acc, wasm_i32x4_mul(
+                          wasm_i32x4_splat((int32_t)Arow[j]),
+                          btm2_i8x4_to_i32x4(B + (size_t)j * in + ic)));
+            }
+            v128_t d = wasm_f32x4_mul(wasm_f32x4_convert_i32x4(acc), vs);
+            wasm_v128_store(Wrow + ic, wasm_f32x4_add(wasm_v128_load(Wrow + ic), d));
+        }
+        for (; ic < in; ic++) {                   /* in % 4 tail */
+            int32_t acc = 0;
+            for (int j = 0; j < r; j++) {
+                acc += (int32_t)Arow[j] * (int32_t)B[(size_t)j * in + ic];
+            }
+            Wrow[ic] += (float)acc * s;
+        }
+    }
+#else
+    /* Native. This path is what a node runs to REBUILD state -- rebuilding after a
+     * reorg replays one apply per block from a snapshot, so its speed sets the recovery
+     * time, not just the eval harness's runtime.
+     *
+     * r == 4 is hoisted for the same reason as the wasm path: with a runtime r the
+     * compiler cannot unroll the j loop, so it cannot see that Arow[j] is invariant
+     * across ic and reloads it per weight. Measured on one record (49,840,128 touched
+     * weights, Xeon E5-1620 v2, 1 thread): 0.1879 s generic -> 0.0934 s hoisted, 2.01x.
+     * A 4-wide SIMD version of the same shape measured 0.0341 s (5.52x), which is
+     * available later without changing results -- see the bit-exactness note below.
+     *
+     * Bit-exact against the generic loop, and this is structural rather than lucky. The
+     * accumulation is int32 and cannot overflow (|int8*int8| <= 16384, times r == 4 is
+     * 65536), so integer associativity makes the summation order irrelevant; the float
+     * work is one convert, one multiply and one add PER WEIGHT either way. Verified
+     * identical across all 108 matrices a record touches, against both this loop and the
+     * 4-wide SIMD form.
+     *
+     * The two float ops stay separate ONLY because the build passes -ffp-contract=off
+     * (see FP_STRICT in the Makefile). Contracted into an FMA, `Wrow[ic] += (float)acc*s`
+     * rounds once instead of twice and yields different weights -- and aarch64's baseline
+     * has fmadd, so an ARM node would diverge from an x86 one with no flag to blame. */
+    if (r == 4) {
+        const int8_t* B0 = B;
+        const int8_t* B1 = B + (size_t)in;
+        const int8_t* B2 = B + (size_t)2 * in;
+        const int8_t* B3 = B + (size_t)3 * in;
+        for (int oc = 0; oc < out; oc++) {
+            const int8_t* Arow = A + (size_t)oc * 4;
+            float* Wrow = W + (size_t)oc * in;
+            const int32_t a0 = Arow[0], a1 = Arow[1], a2 = Arow[2], a3 = Arow[3];
+            for (int ic = 0; ic < in; ic++) {
+                int32_t acc = a0 * (int32_t)B0[ic] + a1 * (int32_t)B1[ic]
+                            + a2 * (int32_t)B2[ic] + a3 * (int32_t)B3[ic];
+                Wrow[ic] += (float)acc * s;
+            }
+        }
+        return;
+    }
     for (int oc = 0; oc < out; oc++) {
         const int8_t* Arow = A + (size_t)oc * r;
         float* Wrow = W + (size_t)oc * in;
@@ -189,6 +297,7 @@ static inline void btm2_apply_lora_int8(float* W, int out, int in, int r,
             Wrow[ic] += (float)acc * s;
         }
     }
+#endif
 }
 
 // ----------------------------------------------------------------------------

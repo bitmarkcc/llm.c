@@ -23,13 +23,26 @@ inconsistency correctly scores as "no valid solution" and leaves the block valid
 exception is chain_unavailable, which the node distinguishes by its exception message and
 escalates as a local fault; nothing here produces that.
 */
+/*
+BTM_ONCHAIN, not __wasm__, is the discriminator. There are THREE builds, not two:
+
+  native                      the harness: stdio, files, malloc
+  wasm32-wasip1 (WASI)        the same harness compiled to wasm, runnable under wasmtime
+                              -- this is how the SIMD kernel path gets cross-checked
+                              against native for bit-exactness, so it MUST keep main()
+                              and its file I/O
+  wasm32-wasip1 + BTM_ONCHAIN the deployed module: verify() only, chain.* imports only
+
+Gating on __wasm__ collapses the last two and silently destroys the middle one, which is
+the only way to verify that the vector path computes what the scalar path computes.
+*/
 #ifndef BTMHOST_H
 #define BTMHOST_H
 
 #include <stddef.h>
 #include <stdint.h>
 
-#ifdef __wasm__
+#ifdef BTM_ONCHAIN
 
 /* Diagnostics cost an import (fd_write), so on-chain they cost nothing instead. */
 #define BTMLOG(...) ((void)0)
@@ -86,7 +99,7 @@ static inline void* btm_alloc(size_t n) {
 }
 static inline void btm_free(void* p) { free(p); }
 
-#endif /* __wasm__ */
+#endif /* BTM_ONCHAIN */
 
 //! Parse `n` bytes of hex into `out`. Returns 0 on success, non-zero on a bad digit.
 //! Replaces the sscanf("%2x") the root comparison used: sscanf is a large chunk of libc

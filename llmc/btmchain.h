@@ -67,7 +67,7 @@ the one being validated, so folding in chain order means counting DOWN from coun
 #define BTMCHAIN_TOO_SMALL  (-3)
 #define BTMCHAIN_UNAVAILABLE (-4)   /*!< local fault; the node traps rather than returning */
 
-#ifdef __wasm__
+#ifdef BTM_ONCHAIN
 
 __attribute__((import_module("chain"), import_name("slot_block_count")))
 extern int chain_slot_block_count(void);
@@ -193,7 +193,7 @@ static inline int btmchain_solution(const btmchain* ch, int index,
     return (int)ch->len[k];
 }
 
-#endif /* __wasm__ */
+#endif /* BTM_ONCHAIN */
 
 /* ---- backend-independent -------------------------------------------------------- */
 

@@ -261,7 +261,7 @@ train_gpt2: train_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
 
 train_gpt2_btm: train_gpt2_btm.c
-	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) -lcrypto $(OUTPUT_FILE)
+	$(CC) $(CFLAGS) $(FP_STRICT) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) -lcrypto $(OUTPUT_FILE)
 
 eval_gpt2_btm: eval_gpt2_btm.c
 	$(CXX) $(CFLAGS) -DLLMC_PFLOAT $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) -lmimalloc -lcrypto -lmpfr $(OUTPUT_FILE)
@@ -271,35 +271,89 @@ eval_gpt2_btm: eval_gpt2_btm.c
 # strict IEEE float semantics: -O2 only, never -Ofast/-ffast-math/-march=native --
 # determinism is the whole point. The wasm toolchain paths can be overridden, e.g.
 #   make eval_gpt2_btm_f32.wasm WASI_CLANG=clang WASI_SYSROOT=/opt/wasi/sysroot
+#
+# THE INVARIANT: every float operation in these binaries must be a single IEEE-754
+# single-precision operation, rounded once. Two things can break it, and only one of
+# them was previously guarded.
+#
+#   -Ofast/-ffast-math/-march=native   reassociate and relax rounding. Excluded above.
+#   FMA CONTRACTION                    `a += b * c` is ONE statement, so C lets the
+#                                      compiler fuse it into a multiply-add that rounds
+#                                      ONCE where the source rounds twice. Different
+#                                      result, same source. gcc and clang default to
+#                                      -ffp-contract=fast, so this is opt-OUT.
+#
+# x86-64 was safe only by accident: -O2 with no -march targets the baseline ISA, which
+# has no FMA instruction to contract into. Measured on this source:
+#
+#   gcc   -O2                                      0 FMA instructions
+#   gcc   -O2 -march=haswell                       2
+#   gcc   -O3 -march=haswell -ffp-contract=off     0
+#   clang --target=aarch64 -O2                     1   <-- no special flags at all
+#   clang --target=aarch64 -O2 -ffp-contract=off   0
+#
+# aarch64's BASELINE includes fmadd, so an ARM node built with plain -O2 computes
+# different weights than an x86 node -- a fork, with no flag to blame. FP_STRICT is
+# therefore mandatory on every target below, native and wasm alike, and must not be
+# dropped for any reason. It changes nothing on baseline x86-64 (no FMA was emitted
+# there to begin with), so the chain and every prior measurement remain valid.
+#
+# The MINER (train_gpt2_btm_*) carries FP_STRICT too, but it is NOT sufficient there and
+# must not be read as making the miner deterministic. The miner builds with CFLAGS:
+#
+#   cc -g3 -Ofast ... -march=native -fopenmp -DOMP
+#
+# -Ofast implies -ffast-math, which on x86 links crtfastmath.o -- and that sets FTZ and
+# DAZ in MXCSR for the WHOLE PROCESS. -ffp-contract=off does not undo it. Measured:
+#
+#   gcc -O2                        MXCSR=0x1f80  FTZ=0  DAZ=0
+#   gcc -O2 -ffp-contract=off      MXCSR=0x1f80  FTZ=0  DAZ=0
+#   gcc -Ofast                     MXCSR=0x9fc0  FTZ=1  DAZ=1
+#   gcc -Ofast -ffp-contract=off   MXCSR=0x9fc0  FTZ=1  DAZ=1   <-- flag does not help
+#
+# So the miner still flushes denormals where the verifier does not, and -march=native
+# additionally makes FMA available on any Haswell-or-later host. This does NOT fork the
+# chain: the miner's output is int8 deltas, which the verifier applies to its OWN base
+# state with its own arithmetic, so a record stays valid either way. What breaks is the
+# miner's PREDICTION of its own score -- it rebuilds the base state with different float
+# behaviour, so the improvement it measures is not the improvement the network will
+# measure, and near the gate threshold that is the difference between submitting a record
+# that passes and one that does not. Lost work, not a fork.
+#
+# Closing it means dropping -Ofast (and -march=native) for the miner, which costs
+# training throughput -- already the binding constraint at ~45 min per 480-step record
+# against a 16 min slot. Left as a deliberate open item rather than silently traded away.
+FP_STRICT = -ffp-contract=off
+
 WASI_CLANG ?= /usr/lib/llvm/21/bin/clang
 WASI_SYSROOT ?= $(HOME)/.local/share/wasi/sysroot
 WASI_BUILTINS ?= $(HOME)/.local/share/wasi/lib/wasi/libclang_rt.builtins-wasm32.a
 
 eval_gpt2_btm_f32: eval_gpt2_btm_f32.c
-	$(CC) -O2 $(INCLUDES) $^ -lm $(OUTPUT_FILE)
+	$(CC) -O2 $(FP_STRICT) $(INCLUDES) $^ -lm $(OUTPUT_FILE)
 
 eval_gpt2_btm_f32.wasm: eval_gpt2_btm_f32.c
-	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 $^ -o $@ -nodefaultlibs -lc $(WASI_BUILTINS)
+	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 $(FP_STRICT) $^ -o $@ -nodefaultlibs -lc $(WASI_BUILTINS)
 
 # v2: LoRA structured-delta miner + verifier (llmc/btmrecord.h format)
 train_gpt2_btm2: train_gpt2_btm2.c
-	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
+	$(CC) $(CFLAGS) $(FP_STRICT) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
 
 eval_gpt2_btm2_f32: eval_gpt2_btm2_f32.c
-	$(CC) -O2 $(INCLUDES) $^ -lm $(OUTPUT_FILE)
+	$(CC) -O2 $(FP_STRICT) $(INCLUDES) $^ -lm $(OUTPUT_FILE)
 
 eval_gpt2_btm2_f32.wasm: eval_gpt2_btm2_f32.c
-	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 $^ -o $@ -nodefaultlibs -lc $(WASI_BUILTINS)
+	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 $(FP_STRICT) $^ -o $@ -nodefaultlibs -lc $(WASI_BUILTINS)
 
 # toy MoE: E=4 experts, k=2, depth 6 (llmc/btmmoe.h)
 train_gpt2_btm_moe: train_gpt2_btm_moe.c
-	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
+	$(CC) $(CFLAGS) $(FP_STRICT) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
 
 eval_gpt2_btm_moe_f32: eval_gpt2_btm_moe_f32.c
-	$(CC) -O2 $(INCLUDES) $^ -lm $(OUTPUT_FILE)
+	$(CC) -O2 $(FP_STRICT) $(INCLUDES) $^ -lm $(OUTPUT_FILE)
 
 eval_gpt2_btm_moe_f32.wasm: eval_gpt2_btm_moe_f32.c
-	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 $^ -o $@ -nodefaultlibs -lc $(WASI_BUILTINS)
+	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 $(FP_STRICT) $^ -o $@ -nodefaultlibs -lc $(WASI_BUILTINS)
 
 # trunk: C=768, V=16384, fine experts H=384, k=4, E=32 -- 269M params, 1.004 GiB in f32.
 # E=64 (1.849 GiB) also fit the verifier's 1.984 GiB cap, but left only ~81 MiB free;
@@ -307,16 +361,16 @@ eval_gpt2_btm_moe_f32.wasm: eval_gpt2_btm_moe_f32.c
 # 4x. E must match between the miner and the verifier: it sizes the router entry and
 # therefore the framing of every record.
 train_gpt2_btm_trunk: train_gpt2_btm_trunk.c
-	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
+	$(CC) $(CFLAGS) $(FP_STRICT) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
 
 eval_gpt2_btm_trunk_f32: eval_gpt2_btm_trunk_f32.c
-	$(CC) -O2 $(INCLUDES) $^ -lm $(OUTPUT_FILE)
+	$(CC) -O2 $(FP_STRICT) $(INCLUDES) $^ -lm $(OUTPUT_FILE)
 
 eval_gpt2_btm_trunk_f32.wasm: eval_gpt2_btm_trunk_f32.c
-	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 $^ -o $@ -nodefaultlibs -lc $(WASI_BUILTINS)
+	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 $(FP_STRICT) $^ -o $@ -nodefaultlibs -lc $(WASI_BUILTINS)
 
 eval_gpt2_btm_trunk_f32_simd.wasm: eval_gpt2_btm_trunk_f32.c
-	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 -msimd128 $^ -o $@ -nodefaultlibs -lc $(WASI_BUILTINS)
+	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 -msimd128 $(FP_STRICT) $^ -o $@ -nodefaultlibs -lc $(WASI_BUILTINS)
 
 # The ON-CHAIN module: exports verify(), imports nothing but chain.*.
 #
@@ -340,7 +394,7 @@ eval_gpt2_btm_trunk_f32_simd.wasm: eval_gpt2_btm_trunk_f32.c
 # GC_SIMD instead (cap 5e9) at four lanes per op. The kernel is written so both produce
 # bit-identical results (see btmk_dot), so this is a gas decision, not a numerics one.
 eval_gpt2_btm_trunk_f32_algo.wasm: eval_gpt2_btm_trunk_f32.c
-	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 -msimd128 $^ -o $@ \
+	$(WASI_CLANG) --target=wasm32-wasip1 --sysroot=$(WASI_SYSROOT) -O2 -msimd128 $(FP_STRICT) -DBTM_ONCHAIN $^ -o $@ \
 	    -nodefaultlibs -nostartfiles -lc $(WASI_BUILTINS) \
 	    -Wl,--no-entry -Wl,--export=verify
 	@n=$$(strings -a $@ | grep -c __imported_wasi || true); \

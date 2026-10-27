@@ -21,7 +21,7 @@ miner; the v2 logic starts at "v2 LoRA miner" near the end of the file.
 #include <stdbool.h>
 #include <math.h>
 #include <string.h>
-#ifndef __wasm__
+#ifndef BTM_ONCHAIN
 // Host-only: an on-chain module imports nothing but chain.*, and every one of these
 // reaches for WASI -- stdio for fd_write, time for clock_time_get, stdlib for proc_exit.
 #include <stdio.h>
@@ -43,7 +43,7 @@ miner; the v2 logic starts at "v2 LoRA miner" near the end of the file.
 #include "llmc/btmmoe.h"
 // defines: btmk_dot / matmul_forward_k -- the canonical 4-accumulator kernel
 #include "llmc/btmkernel.h"
-#ifndef __wasm__
+#ifndef BTM_ONCHAIN
 // defines: node-side weight-state cache (NOT consensus; needs stdio)
 #include "llmc/btmcache.h"
 #endif
@@ -104,15 +104,15 @@ miner; the v2 logic starts at "v2 LoRA miner" near the end of the file.
 #endif
 // our own utilities
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
-#ifndef __wasm__
+#ifndef BTM_ONCHAIN
 #include "llmc/utils.h"   /* fopenCheck/hex_to_uchar: the native harness only */
 #endif
 // defines: tokenizer_init, tokenizer_decode, tokenizer_free
-#ifndef __wasm__
+#ifndef BTM_ONCHAIN
 #include "llmc/tokenizer.h"   /* unused by the verifier */
 #endif
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
-#ifndef __wasm__
+#ifndef BTM_ONCHAIN
 #include "llmc/dataloader.h"   /* the scored window comes from the record, not a loader */
 #endif
 
@@ -361,6 +361,14 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
 void attention_forward(float* out, float* preatt, float* att,
                        float* inp,
                        int B, int T, int C, int NH) {
+#ifdef BTMV_MEASURE_NO_ATTENTION
+    // MEASUREMENT ONLY: zero the output and return, to price attention's share of the
+    // gas classes by difference. Produces wrong losses by construction.
+    (void)preatt; (void)att; (void)NH;
+    for (int i = 0; i < B * T * C; i++) out[i] = 0.0f;
+    return;
+#endif
+
     // input is (B, T, 3C) holding the query, key, value (Q, K, V) vectors
     // preatt, att are (B, NH, T, T). NH = number of heads, T = sequence length
     // that holds the pre-attention and post-attention scores (used in backward)
@@ -759,7 +767,7 @@ typedef struct {
 
 // ---- host-only: a model checkpoint file and the v1 random init. Neither is reachable
 // from gpt2_eval_trunk (the trunk builds from the chain), and both need stdio.
-#ifndef __wasm__
+#ifndef BTM_ONCHAIN
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     // read in model from a checkpoint file
@@ -986,7 +994,7 @@ void gpt2_build_from_random(GPT2 *model, int depth, size_t n_active_weights, uns
 // renormalized softmax gates, out = sum_s gate_s * expert_s(x). Caches logits,
 // selection, gates, per-slot hidden activations, and per-slot pre-gate outputs
 // for the backward pass. Parallel over tokens (disjoint writes; deterministic).
-#endif /* !__wasm__ */
+#endif /* !BTM_ONCHAIN */
 void moe_ffn_forward(float* out, float* fch, float* fch_gelu,
                      float* router_logits, float* gates, float* expert_sel, float* expert_out,
                      const float* inp,
@@ -994,6 +1002,16 @@ void moe_ffn_forward(float* out, float* fch, float* fch_gelu,
                      const float* fcprojw, const float* fcprojb,
                      const float* routerw, const float* routerb,
                      int B, int T, int C, int E, int K) {
+#ifdef BTMV_MEASURE_NO_MOE
+    // MEASUREMENT ONLY: zero the output and return, to price the MoE FFN's share of the
+    // gas classes by difference. Produces wrong losses by construction.
+    (void)fch; (void)fch_gelu; (void)router_logits; (void)gates; (void)expert_sel;
+    (void)expert_out; (void)inp; (void)fcw; (void)fcb; (void)fcprojw; (void)fcprojb;
+    (void)routerw; (void)routerb; (void)E; (void)K;
+    for (int i = 0; i < B * T * C; i++) out[i] = 0.0f;
+    return;
+#endif
+
     int H = MOE_H; // expert hidden width (fine-grained)
     #pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) {
@@ -1037,7 +1055,7 @@ void moe_ffn_forward(float* out, float* fch, float* fch_gelu,
 // select the same expert, so weight-gradient accumulation would race under OMP.
 // dinp accumulates (+=); weight grads accumulate into the zeroed grads buffers.
 // ---- host-only: the backward pass. A verifier only ever runs forward.
-#ifndef __wasm__
+#ifndef BTM_ONCHAIN
 void moe_ffn_backward(float* dinp,
                       float* dfcw, float* dfcb, float* dfcprojw, float* dfcprojb,
                       float* drouterw, float* drouterb,
@@ -1113,7 +1131,7 @@ void moe_ffn_backward(float* dinp,
     }
 }
 
-#endif /* !__wasm__ */
+#endif /* !BTM_ONCHAIN */
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     // targets are optional and could be NULL
 
@@ -1279,7 +1297,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
 // ---- host-only: zero_grad, backward and the AdamW update. Mining needs them; a
 // verifier does not, and dropping them removes the only float_control-sensitive
 // code a verifier would otherwise carry.
-#ifndef __wasm__
+#ifndef BTM_ONCHAIN
 void gpt2_zero_grad(GPT2 *model) {
     if(model->grads_memory != NULL) { memset(model->grads_memory, 0, model->num_parameters * sizeof(float)); }
     if(model->grads_acts_memory != NULL) { memset(model->grads_acts_memory, 0, model->num_activations * sizeof(float)); }
@@ -1435,7 +1453,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     }
 }
 
-#endif /* !__wasm__ */
+#endif /* !BTM_ONCHAIN */
 void gpt2_free(GPT2 *model) {
     btm_free(model->params_memory);
     btm_free(model->grads_memory);
@@ -1522,7 +1540,7 @@ void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes, size_t
     // bounds a rebuild to one epoch rather than the whole history.
     size_t start_off = 0;
     int need_init = 1;
-#ifndef __wasm__
+#ifndef BTM_ONCHAIN
     const char* cache_path = "btm-trunk-state.bin";
     unsigned char cache_tip[32];
     if (btmcache_load(cache_path, cache_tip, model->params_memory, model->num_parameters) == 0) {
@@ -1543,7 +1561,7 @@ void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes, size_t
             }
         }
     }
-#endif /* !__wasm__ */
+#endif /* !BTM_ONCHAIN */
     if (need_init) {
         BTMLOG("state cache miss: full rebuild\n");
         memset(model->params_memory, 0, num_parameters_bytes);
@@ -1555,7 +1573,7 @@ void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes, size_t
     }
 
     int applied_any = 0;
-#ifndef __wasm__
+#ifndef BTM_ONCHAIN
     unsigned char newtip[32];
     btmcache_genesis_tip(newtip);
 #endif
@@ -1582,7 +1600,7 @@ void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes, size_t
         applied_any = 1;
         off += rsz;
     }
-#ifndef __wasm__
+#ifndef BTM_ONCHAIN
     if (need_init || applied_any) {
         if (last_head_off != (size_t)-1) memcpy(newtip, cp + last_head_off, 32);
         // Never cache the state of a chain supplied by BTM_CHAIN. A candidate record's
@@ -1597,7 +1615,7 @@ void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes, size_t
             BTMLOG("warning: could not write state cache\n");
         }
     }
-#endif /* !__wasm__ */
+#endif /* !BTM_ONCHAIN */
 }
 
 //! Score the LAST record of `cp` by how much it IMPROVES the loss of the chain before it,
@@ -1768,9 +1786,15 @@ static int btmv_score(GPT2* model, const uchar* rec, size_t rec_len,
     {
         size_t moe_offsets[BTMMOE_NUM_TENSORS];
         btmmoe_tensor_offsets(model->param_sizes, moe_offsets);
+#ifdef BTMV_MEASURE_NO_APPLY
+        // MEASUREMENT ONLY: skip applying the record, to price it by difference. Makes
+        // both forwards identical, so improvement comes out as exactly zero.
+        if (0) {
+#else
         if (btmmoe_apply_record_h(model->params_memory, rec, rec_len,
                                   12, 768, MOE_E, MOE_H, model->param_sizes,
                                   moe_offsets) != 0) {
+#endif
             BTMLOG("no valid solution: cannot apply the scored record\n");
             return 1;
         }
@@ -1880,7 +1904,7 @@ int gpt2_eval_trunk(float* ploss, float* pbase_loss, uchar* block_hash,
 }
 
 // ---- host-only: the native harness. On-chain the entry point is verify(), below.
-#ifndef __wasm__
+#ifndef BTM_ONCHAIN
 int main(int argc, char** argv) {
 
     BTM_ASSERT(CHAR_BIT == 8);
@@ -1904,7 +1928,7 @@ int main(int argc, char** argv) {
     }
 
     const char* cpfname = "btm-cp-trunk.bin";
-#ifndef __wasm__
+#ifndef BTM_ONCHAIN
     // DIAGNOSTIC ONLY, absent from every consensus path (the wasm verifier has no
     // environment): score a DIFFERENT chain file without moving anything.
     //
@@ -1953,8 +1977,8 @@ int main(int argc, char** argv) {
     return ret;
 }
 
-#endif /* !__wasm__ */
-#ifdef __wasm__
+#endif /* !BTM_ONCHAIN */
+#ifdef BTM_ONCHAIN
 // ----------------------------------------------------------------------------
 // On-chain entry point.
 //
@@ -2087,4 +2111,4 @@ int verify(const unsigned char* anchor_hash,
     return btmv_score(&model, nonce, nonce_len, vin, vtar, nbits, gate_g,
                       &base_loss, &val_loss);
 }
-#endif /* __wasm__ */
+#endif /* BTM_ONCHAIN */
