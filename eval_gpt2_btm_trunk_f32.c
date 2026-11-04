@@ -52,52 +52,8 @@ miner; the v2 logic starts at "v2 LoRA miner" near the end of the file.
 #include "llmc/btmcorpus.h"
 #include "llmc/btmcorpus_params.h"
 
-// trunk configuration (consensus parameters of this chain)
-//
-// E=32 => 269,428,992 total params = 1.004 GiB in f32. An expert is 2 * C*H * L =
-// 2 * 768*384 * 12 = 7,077,888 params, so halving E from 64 frees 226M params.
-//
-// NOT chosen to fit the verifier's 1.984 GiB linear-memory cap -- E=64 (1.849 GiB) fit
-// that. Chosen for the CHECKPOINT BUDGET.
-//
-// verify() must stream the weight checkpoint AND fold every delta published since it,
-// inside GAS_IO_BYTES_LIMIT (2 GiB) and GAS_IO_CALLS_LIMIT (4096). A smaller model leaves
-// room for more deltas per epoch, and at 16 min per slot block (NUM_ALGOS=8 x 2 min) that
-// is the length of the mining period between checkpoints:
-//
-//     E=64:  1.8485 GiB checkpoint -> 272 deltas fit ->  3.0 days of mining per epoch
-//     E=32:  1.0021 GiB checkpoint -> 1508 deltas fit -> 16.8 days of mining per epoch
-//
-// E=64 also made the checkpoint unpublishable in practice: 1.85 GiB takes ~2,036 slot
-// blocks (22.6 days) to transmit against a 3.0-day staleness bound, so it could never be
-// kept current, forcing dedicated publish phases and a ~12% useful-work duty cycle.
-//
-// A secondary gain: the model build streams half as much, ~19.6 s -> ~10 s measured.
-//
-// The freed linear memory (139 MiB -> 1006 MiB under the cap, against 52.7 MiB per
-// scoring window) would also permit scoring a record on ~19 windows instead of 1, which
-// would cut the gate's estimator noise as sqrt(W), sigma 0.067 -> ~0.015. That is NOT
-// done, and the blocker is gas, not memory: the forward is compute-bound (~4.4 FLOP per
-// weight byte), so W windows cost ~W times the instruction count, and the existing two
-// forwards already sit near GAS_LIMIT[GC_SIMD]. See the note at the scoring site in
-// eval_gpt2_btm_trunk_f32.c. E=32 keeps that option open for the day those limits are
-// revisited; it does not take it.
-//
-// The cost is half the trunk's expert capacity, which is a real loss for something whose
-// purpose is to BE a knowledge base. The settled 32:1 target (E~300, 2.2B, 8.8 GB) needs
-// memory64 or lazy expert loading -- see doc. All machinery below is E-agnostic.
-//
-// CONSENSUS-CRITICAL and must match the other file: E sizes the router entry (out = E)
-// and therefore the FRAMING of every record, and it sizes the base init and the expert
-// rotation, so a miner and a verifier that disagree cannot even walk the same chain.
-#ifndef MOE_E
-#define MOE_E 32
-#endif
-//! Vocabulary. CONSENSUS: sizes wte and the lm_head, so it frames the record's
-//! dense entries exactly as E frames the router's.
-#define TRUNK_VOCAB 16384
-#define MOE_K 4   // active experts per token
-#define MOE_H 384 // expert hidden width (C/2): fine-grained experts
+// defines: the trunk geometry (E, K, H, L, C, V) -- CONSENSUS, single source of truth
+#include "llmc/btmtrunk_params.h"
 #include <float.h>
 #ifdef OMP
 #include <omp.h>
@@ -1489,9 +1445,9 @@ void gpt2_free(GPT2 *model) {
 //! wrong. Shared by the native file path and the on-chain fold path so the two cannot
 //! drift apart in geometry.
 static size_t gpt2_init_trunk_params(GPT2 *model) {
-    model->config.num_layers = 12;
-    model->config.channels = 768;
-    model->config.num_heads = 12;
+    model->config.num_layers = TRUNK_LAYERS;
+    model->config.channels = TRUNK_CHANNELS;
+    model->config.num_heads = TRUNK_HEADS;
     model->config.max_seq_len = 1024;
     model->config.vocab_size = TRUNK_VOCAB;
     model->config.padded_vocab_size = TRUNK_VOCAB;
@@ -1554,7 +1510,7 @@ void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes, size_t
             // score, which would make the improvement come out as zero.
             size_t off = 0;
             while (off < cp_limit) {
-                size_t rsz = btmmoe_record_size_h(cp + off, cp_limit - off, 768, MOE_H, MOE_E);
+                size_t rsz = btmmoe_record_size_h(cp + off, cp_limit - off, TRUNK_CHANNELS, MOE_H, MOE_E);
                 if (rsz == 0) break;
                 if (memcmp(cp + off, cache_tip, 32) == 0) { need_init = 0; start_off = off + rsz; break; }
                 off += rsz;
@@ -1565,8 +1521,8 @@ void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes, size_t
     if (need_init) {
         BTMLOG("state cache miss: full rebuild\n");
         memset(model->params_memory, 0, num_parameters_bytes);
-        btmmoe_init_base_params(model->params_memory, model->param_sizes, moe_offsets,
-                                12, 768, model->config.vocab_size, MOE_E, MOE_H, BTM2_BASE_SEED);
+        btmmoe_init_base_params_cb(model->params_memory, model->param_sizes, moe_offsets,
+                                TRUNK_LAYERS, TRUNK_CHANNELS, model->config.vocab_size, MOE_E, MOE_H, BTM2_BASE_SEED);
         start_off = 0;
     } else {
         BTMLOG("state cache hit (resuming at chain offset %zu)\n", start_off);
@@ -1584,17 +1540,17 @@ void gpt2_build_from_chain_trunk(GPT2 *model, uchar* cp, size_t cp_bytes, size_t
         // file: the cache stores the state at cp_limit.
         size_t o2 = 0;
         while (o2 < cp_limit) {
-            size_t rsz = btmmoe_record_size_h(cp + o2, cp_limit - o2, 768, MOE_H, MOE_E);
+            size_t rsz = btmmoe_record_size_h(cp + o2, cp_limit - o2, TRUNK_CHANNELS, MOE_H, MOE_E);
             if (rsz == 0) break;
             last_head_off = o2;
             o2 += rsz;
         }
     }
     while (off < cp_limit) {
-        size_t rsz = btmmoe_record_size_h(cp + off, cp_limit - off, 768, MOE_H, MOE_E);
+        size_t rsz = btmmoe_record_size_h(cp + off, cp_limit - off, TRUNK_CHANNELS, MOE_H, MOE_E);
         if (rsz == 0) { BTMLOG("error: malformed trunk chain record at offset %zu\n", off); BTM_ABORT(); }
         if (btmmoe_apply_record_h(model->params_memory, cp + off, rsz,
-                                  12, 768, MOE_E, MOE_H, model->param_sizes, moe_offsets) != 0) {
+                                  TRUNK_LAYERS, TRUNK_CHANNELS, MOE_E, MOE_H, model->param_sizes, moe_offsets) != 0) {
             BTMLOG("error: failed to apply trunk chain record at offset %zu\n", off); BTM_ABORT();
         }
         applied_any = 1;
@@ -1685,7 +1641,7 @@ static int btmv_proof_window(const uchar* rec, size_t rec_len, const uchar prev_
         const unsigned char* e = rec + BTM2_HEADER_BYTES;
         size_t left = rec_len - BTM2_HEADER_BYTES;
         for (uint16_t i = 0; i < n_ent; i++) {
-            size_t esz = btmmoe_entry_size_h(e, left, 768, MOE_H, MOE_E);
+            size_t esz = btmmoe_entry_size_h(e, left, TRUNK_CHANNELS, MOE_H, MOE_E);
             if (esz == 0 || esz > left) {
                 BTMLOG("no valid solution: malformed entry %u\n", i);
                 btm_free(preimage);
@@ -1792,7 +1748,7 @@ static int btmv_score(GPT2* model, const uchar* rec, size_t rec_len,
         if (0) {
 #else
         if (btmmoe_apply_record_h(model->params_memory, rec, rec_len,
-                                  12, 768, MOE_E, MOE_H, model->param_sizes,
+                                  TRUNK_LAYERS, TRUNK_CHANNELS, MOE_E, MOE_H, model->param_sizes,
                                   moe_offsets) != 0) {
 #endif
             BTMLOG("no valid solution: cannot apply the scored record\n");
@@ -1868,7 +1824,7 @@ int gpt2_eval_trunk(float* ploss, float* pbase_loss, uchar* block_hash,
 
     size_t off = 0, last_off = 0, last_size = 0, prev_off = (size_t)-1;
     while (off < cp_bytes) {
-        size_t rsz = btmmoe_record_size_h(cp + off, cp_bytes - off, 768, MOE_H, MOE_E);
+        size_t rsz = btmmoe_record_size_h(cp + off, cp_bytes - off, TRUNK_CHANNELS, MOE_H, MOE_E);
         if (rsz == 0) { BTMLOG("error: malformed trunk chain record at offset %zu\n", off); return 1; }
         if (off + rsz >= cp_bytes) { last_off = off; last_size = rsz; }
         else { prev_off = off; }
@@ -1877,9 +1833,14 @@ int gpt2_eval_trunk(float* ploss, float* pbase_loss, uchar* block_hash,
     if (last_size == 0) { BTMLOG("error: no complete record in chain data\n"); return 1; }
 
     uchar prev_head[32];
+    // Previous record in the file, else an explicit block_hash, else the genesis state
+    // id -- the same precedence the miner uses, and the last rung must match it or the
+    // harness scores a window the miner never aimed at. On chain this whole ladder
+    // collapses to btmv_prev_head reading the newest solution-bearing slot block, which
+    // for the first record is the genesis commitment carrying BTM_GENESIS_STATE_ID.
     if (prev_off != (size_t)-1) memcpy(prev_head, cp + prev_off, 32);
     else if (block_hash) memcpy(prev_head, block_hash, 32);
-    else memset(prev_head, 255, 32);
+    else memcpy(prev_head, BTM_GENESIS_STATE_ID, 32);
 
     int vin[BTM_CORPUS_SCORE_T], vtar[BTM_CORPUS_SCORE_T];
     if (btmv_proof_window(cp + last_off, last_size, prev_head, vin, vtar) != 0) return 1;
@@ -1988,6 +1949,8 @@ int main(int argc, char** argv) {
 //
 // defines: the chain source and its fold-and-discard iterator
 #include "llmc/btmchain.h"
+// defines: the slot state imports (state_size/read/write)
+#include "llmc/btmstate.h"
 
 //! Largest solution this verifier will accept. A record at E=32 is 593,583 bytes, and
 //! MAX_SOLUTION_TX_WEIGHT caps a block's solution payload near 975 KB regardless, so a
@@ -2017,12 +1980,30 @@ typedef struct {
 
 static int btmv_fold_one(const unsigned char* rec, size_t len, void* c) {
     btmv_fold_ctx* f = (btmv_fold_ctx*)c;
-    if (btmmoe_apply_record_h(f->model->params_memory, rec, len, 12, 768, MOE_E, MOE_H,
+    if (btmmoe_apply_record_h(f->model->params_memory, rec, len, TRUNK_LAYERS, TRUNK_CHANNELS, MOE_E, MOE_H,
                               f->model->param_sizes, f->moe) != 0) {
         f->err = 1;
         return -1;
     }
     return 0;
+}
+
+typedef struct {
+    const float* params;
+    int err;
+} btmv_write_ctx;
+
+//! One touched matrix, handed to the node as a byte range of the slot's state. The
+//! parameter array IS the state, byte for byte and in the same order, so a float offset
+//! scales to a state offset by 4 -- no mapping table, and nothing to keep in sync beyond
+//! that identity.
+static void btmv_write_range(void* c, size_t offset_floats, size_t numel) {
+    btmv_write_ctx* w = (btmv_write_ctx*)c;
+    if (w->err) return;                  /* first failure wins; keep walking cheaply */
+    if (btmstate_write((uint64_t)offset_floats * 4u, w->params + offset_floats,
+                       (uint64_t)numel * 4u) != 0) {
+        w->err = 1;
+    }
 }
 
 //! The newest APPROVED record's head, which is the candidate's prev_head. Scans down from
@@ -2072,33 +2053,110 @@ int verify(const unsigned char* anchor_hash,
     unsigned char prev_head[32];
     int ph = btmv_prev_head(&ch, buf, BTMV_RECORD_MAX, prev_head);
     if (ph < 0) return 1;
-    if (ph == 0) memcpy(prev_head, anchor_hash, 32);   /* first record of the chain */
 
-    // Proof first, model second: everything btmv_proof_window checks is in the record.
-    int vin[BTM_CORPUS_SCORE_T], vtar[BTM_CORPUS_SCORE_T];
-    if (btmv_proof_window(nonce, nonce_len, prev_head, vin, vtar) != 0) return 1;
-
-    // The base state: the fixed-seed init with every approved record folded in. Records
-    // arrive one at a time and are discarded after being applied, because the state
-    // (1.0 GiB) dwarfs anything a block can carry.
     GPT2 model;
     size_t nb = gpt2_init_trunk_params(&model);
     if (nb == 0) return 1;               /* does not fit under WASM_MAX_MEMORY_PAGES */
     size_t moe_offsets[BTMMOE_NUM_TENSORS];
     btmmoe_tensor_offsets(model.param_sizes, moe_offsets);
-    memset(model.params_memory, 0, nb);
-    btmmoe_init_base_params(model.params_memory, model.param_sizes, moe_offsets,
-                            12, 768, model.config.vocab_size, MOE_E, MOE_H, BTM2_BASE_SEED);
 
-#ifdef BTMV_MEASURE_INIT_ONLY
-    // MEASUREMENT BUILDS ONLY: stop after the base init so its gas cost can be separated
-    // from the fold and the two forwards. Never build the deployed module with this.
-    return 1;
-#endif
-    btmv_fold_ctx fc;
-    fc.model = &model; fc.moe = moe_offsets; fc.err = 0;
-    if (btmchain_fold(&ch, 0, buf, BTMV_RECORD_MAX, btmv_fold_one, &fc) < 0 || fc.err)
+    // The slot's state must be declared at this model's size on BOTH paths. A state of
+    // another size belongs to a different geometry, and there is no fallback that could
+    // make it meaningful -- the genesis branch below is the only way a state is ever
+    // created, so a mismatch here means the slot was declared for another algo.
+    if (btmstate_size() != (uint64_t)nb) {
+        BTMLOG("no valid solution: slot state is %llu bytes, this model needs %zu\n",
+               (unsigned long long)btmstate_size(), nb);
         return 1;
+    }
+
+    // ---- GENESIS: no accepted record yet, so this block's job is to CREATE the state --
+    //
+    // THE DISCRIMINATOR IS THE CHAIN, not the store. `ph == 0` means btmv_prev_head found
+    // no accepted record in the slot's whole addressable window, which is a fact about
+    // the chain and so identical on every node. The obvious alternative -- "the state is
+    // empty" -- does not work: the slot's size is DECLARED at activation, so state_size()
+    // is already 1.076 GB before a byte is written, and "unwritten" is indistinguishable
+    // from "written to zero" by design (see statedb.h). Asking the store would also make
+    // a consensus branch depend on local disk, which is the one thing it must not do.
+    //
+    // The state is a pure function of the module, so there is nothing for a miner to
+    // search and nothing for a verifier to be convinced of -- every node running this
+    // code computes the same bytes. What the solution carries is the IDENTITY of those
+    // bytes: sha256d over the whole base state, which must equal both the miner's claim
+    // and the constant pinned below. The first catches a miner quoting the wrong model,
+    // the second catches THIS node computing a different one, and the second is the one
+    // that matters -- an init that silently differed between builds would have every node
+    // folding records into its own private model while agreeing with itself.
+    //
+    // NO FORWARD PASSES HERE. There is no record to score: nothing is being improved,
+    // only committed. That is what makes the init affordable at all -- scoring's two
+    // forwards are SIMD 94.3% and SIMD_MEM 89.8% of their caps, so with them present
+    // there is no room for an init of any kind, however cheap.
+    if (ph == 0) {
+        // THE SOLUTION IS A VERSION ASSERTION, NOT A PROOF. There is exactly one valid
+        // genesis solution and it is a constant anyone can read out of the published
+        // module, so quoting it demonstrates no work and no knowledge. It exists for two
+        // mechanical reasons: a block with NO solution takes the no-solution branch, so
+        // its state_writes would be discarded and the state could never be created at
+        // all; and btmv_prev_head needs a 32-byte solution here to give the first record
+        // a prev_head, which is then the base model's own identity.
+        //
+        // Checked FIRST because it is 32 bytes of memcmp, where everything below it is a
+        // 1.076 GB init plus a full sha256d. A wrong claim should not cost that.
+        if (nonce_len != 32) {
+            BTMLOG("no valid solution: genesis solution must be 32 bytes, got %u\n", nonce_len);
+            return 1;
+        }
+        if (memcmp(nonce, BTM_GENESIS_STATE_ID, 32) != 0) {
+            BTMLOG("no valid solution: genesis claim is not the pinned state id\n");
+            return 1;
+        }
+        memset(model.params_memory, 0, nb);
+        btmmoe_init_base_params_cb(model.params_memory, model.param_sizes, moe_offsets,
+                                   TRUNK_LAYERS, TRUNK_CHANNELS, model.config.vocab_size, MOE_E, MOE_H,
+                                   BTM2_BASE_SEED);
+        // AND THIS IS THE CHECK THAT EARNS ITS KEEP -- not about the miner at all. It
+        // asserts that THIS BUILD computes the base model the chain was defined on. The
+        // failure it catches produces no error anywhere else: a compiler that reordered
+        // one float operation, or a regenerated init whose pinned id was not updated,
+        // would have this node fold every record into its own private model and agree
+        // with itself forever.
+        //
+        // Reported as "no valid solution" rather than trapped, deliberately: doc sec 7
+        // step 4 prices every module failure as the no-solution branch, so the block
+        // stays valid and merely unpaid while the operator sees the log.
+        unsigned char got[32];
+        btmmoe_state_digest(model.params_memory, nb, got);
+        if (memcmp(got, BTM_GENESIS_STATE_ID, 32) != 0) {
+            BTMLOG("no valid solution: this build's base state does not match the pinned id\n");
+            return 1;
+        }
+        // The state the rest of the chain folds onto. One write of the whole thing, which
+        // is the only time that happens: every later block writes only what its record
+        // touched.
+        if (btmstate_write(0, model.params_memory, (uint64_t)nb) != 0) {
+            BTMLOG("no valid solution: cannot persist the genesis state\n");
+            return 1;
+        }
+        BTMLOG("genesis state committed (%zu bytes)\n", nb);
+        return 0;
+    }
+
+    // ---- RECORD: score it against the state the chain has already folded -----------
+
+    // Proof before anything expensive: everything btmv_proof_window checks is in the
+    // record, so a bad proof costs a few hashes rather than a gigabyte of state read.
+    int vin[BTM_CORPUS_SCORE_T], vtar[BTM_CORPUS_SCORE_T];
+    if (btmv_proof_window(nonce, nonce_len, prev_head, vin, vtar) != 0) return 1;
+
+    // THE BASE STATE, read rather than rebuilt. The node holds the folded weights off
+    // chain (src/dynamicalgo/statedb.h) and this reads them: 1.076 GB of memcpy against
+    // the I/O byte budget, costing no scalar MEM, FADD or CALL. Rebuilding them instead
+    // -- the init plus a fold of every accepted record -- is what this replaces, and it
+    // did not fit: the old mt19937 init alone measured 18x the MEM cap.
+    if (btmstate_read(0, model.params_memory, (uint64_t)nb) != 0) return 1;
+    BTMLOG("base state read from the slot store (%zu bytes)\n", nb);
 
     // The gate's difficulty, from how many of the last BTM_GATE_WINDOW slot blocks
     // carried a valid solution. One I/O call per probe and zero bytes, which is why the
@@ -2108,7 +2166,30 @@ int verify(const unsigned char* anchor_hash,
     float gate_g = btmmoe_gate_fraction(valid, window);
 
     float base_loss = 0.0f, val_loss = 0.0f;
-    return btmv_score(&model, nonce, nonce_len, vin, vtar, nbits, gate_g,
-                      &base_loss, &val_loss);
+    int rc = btmv_score(&model, nonce, nonce_len, vin, vtar, nbits, gate_g,
+                        &base_loss, &val_loss);
+    if (rc != 0) return rc;              /* not a solution: the state does not move */
+
+    // ACCEPTED, so the state advances. btmv_score applied the record in place, so
+    // params_memory already holds the new weights -- all that is left is to tell the node
+    // which bytes changed. Only the matrices the record touched, because reads and writes
+    // share one I/O byte budget: a full rewrite would be 2.15 GB against a 2 GiB cap,
+    // while a record's 108 matrices are ~200 MB.
+    //
+    // Nothing becomes durable here. These calls describe ranges; the node applies them
+    // when the block connects, which is what keeps verify() safe to run on the mempool
+    // path. A write that fails is an internal inconsistency rather than a bad record, but
+    // it is still reported as "no valid solution": a record whose effect cannot be
+    // persisted must not be paid for, and doc sec 7 step 4 prices every such outcome the
+    // same way.
+    btmv_write_ctx wc;
+    wc.params = model.params_memory; wc.err = 0;
+    if (btmmoe_record_ranges_h(nonce, nonce_len, TRUNK_LAYERS, TRUNK_CHANNELS, MOE_E, MOE_H,
+                               model.param_sizes, moe_offsets,
+                               btmv_write_range, &wc) != 0 || wc.err) {
+        BTMLOG("no valid solution: cannot persist the folded state\n");
+        return 1;
+    }
+    return 0;
 }
 #endif /* BTM_ONCHAIN */

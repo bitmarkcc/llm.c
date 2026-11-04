@@ -60,7 +60,8 @@ started from, both measured on the record's own scoring window:
     base_loss - val_loss  >=  base_loss * 2^-BTM_GATE_SHIFT
 
 RELATIVE, NOT ABSOLUTE, because the achievable improvement shrinks as the trunk learns:
-+1.26 for the genesis record, +0.153 by record 11. Any fixed threshold is eventually
++1.50 for this base's first record, and on the superseded base +1.26 at depth 1 falling
+to +0.153 by depth 11. Any fixed threshold is eventually
 above what an honest record can achieve, and the chain then stalls permanently. A
 fraction of the loss rescales itself with the model. It also matches how the quantity
 behaves -- base loss and improvement correlate across windows (r ~ 0.75 over four
@@ -72,27 +73,67 @@ factor of two, so by Sterbenz their difference is exact too. Every verifier ther
 agrees bit-for-bit with no tolerance to argue about. (Far from the threshold the
 subtraction may round, but only where the outcome is not in doubt.)
 
-WHY 1/64 and not 1/128. Measured at 480 steps, lr 1e-3: improvement mean 0.153,
-sigma 0.067. The cheapest shortcut that still scores above zero is 120 steps, a quarter
-of the work: mean 0.0217, sigma 0.040. Against a base loss of ~8.67:
+CALIBRATION, measured on THIS base model. 1/128, and 1/64 was tried and stalls.
 
-    threshold   honest pass   shortcut pass   honest advantage per minute
-    1/128       90%           12.6%           1.75x   -- nearly free-riding
-    1/64        60%            0.23%          ~65x
+Depth 1 is a random model and behaves nothing like the rest of the chain -- it is reported
+separately because reading it as representative is what made 1/64 look safe:
 
-At 1/128 a miner doing a quarter of the work earns over half the honest rate. At 1/64 the
-shortcut needs a 2.8 sigma window draw instead of 1.1 and collapses. Honest attempts
-failing is not a defect: a record that misses the gate simply is not a solution and the
-miner retries, exactly as a nonce that misses a target. 1/64 costs ~1.7 attempts per
-valid record.
+    depth 1   base 9.89    4 steps -> +0.38873     480 steps -> +1.50247, +1.33062
+              120x the compute buys 3.9x the improvement; both clear any sane bar
 
-CAVEAT, recorded because the exponent depends on it: those means are n=4 each and the
-shortcut's 0.23% is a Gaussian-tail extrapolation from four points, not an observation.
-Real tails run fatter. 1/64 and 1/128 differ by ~37x in discrimination, so the
-uncertainty argues for the tighter exponent -- loosening a consensus constant later is
-the easier direction to move.
+DEPTH 2 ONWARD is the regime that matters. One full-effort record collapses the available
+improvement by ~15x, and from there:
+
+    steps  n      mean       sd   pass@1/64  pass@1/128
+      1    1   0.00561       --     0/1        0/1        (12x short of 1/128)
+    120    4   0.02974  0.02910     0/4        1/4
+    480    5   0.10260  0.04172     1/5        4/5
+
+WHY NOT 1/64: it stalls. 1 of 5 full-effort attempts passed, i.e. ~4.5 attempts per
+record at ~63 min each -- 4.7 hours of work for a 16-minute slot. The chain cannot keep
+up with itself. That is not difficulty, it is a bar above what the work can reach.
+
+WHY 1/128 HOLDS UP. 4 of 5 pass (80%, predicted 80.1%), which also lands on the
+retargeting's own 3/4 target, so the gate starts near equilibrium instead of fighting the
+controller. And the shortcut does not profit: improvement is 86% of LINEAR in steps over
+the 120..480 range (3.45x the improvement for 4x the compute), so cheap records buy
+proportionally less. Per unit of compute, with the shortcut breaking even at a 20% pass
+rate, a 120-step miner passes a predicted 7.6% -- honest work ahead by ~2.6x.
+
+HONEST LIMITS OF THE ABOVE, because the exponent rests on it:
+
+  * n is 4..5 everywhere. The 120-step samples are 0.0149, 0.0145, 0.0734, 0.0162 -- three
+    tight plus one lucky window, so they are not Gaussian and sd 0.0291 is inflated by
+    the outlier. Observed 1/4 (25%) and predicted 7.6% bracket the real shortcut rate,
+    and 25% would make the shortcut marginally PROFITABLE (1.25x). Worth more samples
+    before this is load-bearing.
+  * THE NOISE FLOOR IS THE REAL CONSTRAINT, not the exponent. At 480 steps sd/mean = 0.41:
+    the window-to-window noise is 41% of the signal. No threshold can cleanly separate
+    work levels through that -- whatever passes honest records at 80% admits a cheaper
+    record at some real rate. The fix is multi-window scoring (k windows cuts sd by
+    sqrt(k); at k=16, sd -> 0.010 and a bar just under the honest mean would exclude a
+    quarter-effort record almost entirely) and it is GAS-INFEASIBLE here: k windows is k
+    times the forward tokens and GC_SIMD is already 94.3% of its cap with one. It needs
+    the smaller geometry (L=8, E=16, H=192, ~70M params) to buy the headroom.
+  * SO THE EXPONENT SETS THE PASS RATE, NOT THE EFFORT LEVEL. The effort level is set by
+    the retargeting equilibrium -- where ~1/4 of attempts fail at whatever strategy miners
+    actually use. Pinning it is a model-size decision, not a constant.
+  * Base loss swings 8.06..9.84 across windows at an IDENTICAL chain state, so the bar
+    moves +-8% for reasons unrelated to the record. corr(base, improvement) measured
+    +0.19 here, against the "~0.75 over four samples" an earlier version of this comment
+    claimed -- so scaling the bar by base loss is not tracking a real correlation, and
+    that justification for a RELATIVE gate does not survive. The other one does, and it
+    is the one that matters: achievable improvement falls with depth (+1.50 at depth 1,
+    +0.103 at depth 2), so any ABSOLUTE bar is eventually unreachable.
+
+HISTORICAL, where 1/64 came from, retained so the reversal is traceable and NOT as current
+fact: on the SUPERSEDED mt19937 + Box-Muller base at depth ~11, 480 steps gave mean 0.153 /
+sd 0.067 and a 120-step shortcut mean 0.0217 / sd 0.040, from which 1/64 passed honest
+miners 60% and the shortcut 0.23% -- a ~65x advantage against 1.75x at 1/128. Those were
+n=4 each and the 0.23% was a Gaussian-tail extrapolation from four points. On this base the
+same exponent passes honest miners 20%, so the conclusion inverted.
 */
-#define BTM_GATE_SHIFT 6
+#define BTM_GATE_SHIFT 7
 #define BTM_GATE_FRACTION (1.0f / (float)(1u << BTM_GATE_SHIFT))
 
 /*
@@ -690,12 +731,269 @@ static inline int btmmoe_apply_record_h(float* params, const unsigned char* rec,
     return 0;
 }
 
+//! Walk `rec` and report the parameter range each entry TOUCHES, without applying
+//! anything. `cb(ctx, offset_floats, numel)` is called once per weight-bearing entry, in
+//! record order. Returns 0, or -1 on the same malformations btmmoe_apply_record_h rejects.
+//!
+//! WHY: after applying a record the verifier has to tell the node WHICH bytes of its
+//! state changed, and writing the whole state back is not an option -- reads and writes
+//! share one I/O byte budget (sec 8.7), so a full rewrite of a 1.076 GB state would be
+//! 2.15 GB against a 2 GiB cap. A record touches 108 matrices and ~200 MB, which fits
+//! with room to spare. This walk is what makes the write sparse.
+//!
+//! It MIRRORS the apply above entry for entry, and that correspondence is load-bearing: a
+//! range this misses is a weight the node never persists, so the next block would read a
+//! state that disagrees with the one this block scored. Any change to the apply's offset
+//! arithmetic has to change here too.
+static inline int btmmoe_record_ranges_h(const unsigned char* rec, size_t rec_bytes,
+                                         int L, int C, int E, int H,
+                                         const size_t* param_sizes,
+                                         const size_t* tensor_offsets,
+                                         void (*cb)(void*, size_t, size_t), void* ctx) {
+    uint16_t n_entries;
+    memcpy(&n_entries, rec + 32, 2);
+    const unsigned char* e = rec + BTM2_HEADER_BYTES;
+    size_t left = rec_bytes - BTM2_HEADER_BYTES;
+    for (uint16_t i = 0; i < n_entries; i++) {
+        size_t esz = btmmoe_entry_size_h(e, left, C, H, E);
+        if (esz == 0 || esz > left) return -1;
+        int type = e[0];
+        int layer = e[1];
+        int dtype = e[2];
+        if (dtype == BTM2_DELTA_CORPUS_PROOF) {
+            /* carries the scored window, not a delta: touches no weight */
+        } else if (dtype == BTM2_DELTA_LORA_INT8) {
+            size_t slice = param_sizes[type] / (size_t)L;
+            cb(ctx, tensor_offsets[type] + (size_t)layer * slice, slice);
+        } else if (dtype == BTM2_DELTA_LORA_EXPERT) {
+            int out, in;
+            btmmoe_expert_dims_h(type, C, H, &out, &in);
+            uint16_t expert_id;
+            memcpy(&expert_id, e + 4, 2);
+            if ((int)expert_id >= E) return -1;
+            cb(ctx, btmmoe_expert_matrix_offset_h(type, layer, expert_id, C, H, E, tensor_offsets),
+               (size_t)out * (size_t)in);
+        } else {
+            /* DENSE and SPARSE. SPARSE scatters individual indices, so the touched set is
+             * not one range -- the whole slice is reported instead. Over-wide but never
+             * wrong, and the miner emits neither dtype (every live record is int8 LoRA),
+             * so this costs nothing in practice. */
+            size_t slice = param_sizes[type] / (size_t)L;
+            if (type < 2 || type == 14 || type == 15) slice = param_sizes[type];
+            cb(ctx, tensor_offsets[type] + (size_t)layer * slice, slice);
+        }
+        e += esz;
+        left -= esz;
+    }
+    return 0;
+}
+
 // Fixed-seed random MoE base init (CONSENSUS for trunk chains; genesis needs no
 // function preservation). Distinct random init per expert; SMALL RANDOM router
 // (a zero router would tie all logits and permanently strand experts k..E-1).
 // Draw order: single rng; whole tensors in index order 0,1,4,6,10,12,16;
 // residual-scaled (1/sqrt(2L)) for attproj and expert fcproj; biases zero;
 // layernorm scales one. params must be zeroed by the caller.
+// ----------------------------------------------------------------------------
+// COUNTER-BASED BASE INIT
+//
+// Replaces the mt19937 + Box-Muller init below (kept, superseded, for reference). Same
+// job -- a fixed-seed base model every node agrees on bit for bit -- at a fraction of the
+// gas, because the old one could not run on chain at all.
+//
+// WHAT WAS WRONG WITH THE OLD ONE, measured under the node's own instrumentation:
+//
+//   MEM   5.914e9   18.4x the 320M cap   mt19937's 624-word state, touched per draw
+//   CALL  2.18e9    681% of the cap      Box-Muller's sqrtf/logf/cosf/sinf
+//
+// Neither is fixable by tuning. The state array is what mt19937 IS, and Box-Muller needs
+// transcendentals whatever feeds it. Both go away by construction here:
+//
+//   NO STATE. weight[i] is a pure function of i. Nothing is carried between draws, so
+//   there is no array to touch -- and as a side effect the init becomes order-independent
+//   and trivially parallel, which a stateful generator can never be.
+//
+//   NO TRANSCENDENTALS. Uniform instead of Gaussian. U(-a, a) with a = scale*sqrt(3) has
+//   variance scale^2, identical to N(0, scale), so the weight SCALE every tensor was
+//   tuned for is preserved exactly; only the shape of the tail changes. This is also what
+//   PyTorch's nn.Linear does by default (kaiming uniform), so it is the ordinary choice
+//   rather than a concession.
+//
+// THIS CHANGES THE BASE WEIGHTS, so it is a different model and a different chain. There
+// is no migration and none is possible: the base state is what every record's delta is
+// relative to.
+//
+// The mixer is lowbias32 (two multiply-xorshift rounds), applied to the index offset by
+// the seed. It is a bijection, so distinct indices give distinct outputs. Quality
+// requirements here are modest -- these are starting weights, not keys -- but a cheap
+// mixer with visible structure would correlate weights across a row, so it is worth the
+// two multiplies.
+static inline uint32_t btmmoe_mix32(uint32_t x) {
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+//! Fill `n` floats at `dst` with U(-a, a), where weight j takes index `base + j`.
+//!
+//! Bit-identical between the scalar and SIMD paths by construction, on the same argument
+//! as btmk_dot and the LoRA apply: the integer mixing is exact (uint32 wraps identically
+//! everywhere), and the float tail is one convert, one multiply and one subtract PER
+//! LANE -- no reduction, so no order to get wrong. 24 bits of mantissa are used, which is
+//! all an f32 can hold, via `h >> 8` landing in [0, 2^24) where a signed convert is exact.
+static inline void btmmoe_uniform_fill(float* dst, size_t n, size_t base,
+                                       uint32_t seed_off, float a) {
+    const float span = 2.0f * a;
+    const float inv = 1.0f / 16777216.0f; /* 2^-24, exact */
+    size_t j = 0;
+#ifdef __wasm_simd128__
+    const v128_t vspan = wasm_f32x4_splat(span);
+    const v128_t vinv = wasm_f32x4_splat(inv);
+    const v128_t va = wasm_f32x4_splat(a);
+    const v128_t m1 = wasm_u32x4_splat(0x7feb352du);
+    const v128_t m2 = wasm_u32x4_splat(0x846ca68bu);
+    for (; j + 4 <= n; j += 4) {
+        const uint32_t i0 = (uint32_t)(base + j) + seed_off;
+        v128_t x = wasm_u32x4_make(i0, i0 + 1u, i0 + 2u, i0 + 3u);
+        x = wasm_v128_xor(x, wasm_u32x4_shr(x, 16)); x = wasm_i32x4_mul(x, m1);
+        x = wasm_v128_xor(x, wasm_u32x4_shr(x, 15)); x = wasm_i32x4_mul(x, m2);
+        x = wasm_v128_xor(x, wasm_u32x4_shr(x, 16));
+        /* h >> 8 is in [0, 2^24): a SIGNED convert is exact for it. */
+        v128_t u = wasm_f32x4_convert_i32x4(wasm_u32x4_shr(x, 8));
+        v128_t f = wasm_f32x4_sub(wasm_f32x4_mul(wasm_f32x4_mul(u, vinv), vspan), va);
+        wasm_v128_store(dst + j, f);
+    }
+#endif
+    for (; j < n; j++) {
+        uint32_t h = btmmoe_mix32((uint32_t)(base + j) + seed_off);
+        dst[j] = (float)(int32_t)(h >> 8) * inv * span - a;
+    }
+}
+
+//! A bit-sensitive digest of a state buffer: a vectorised checksum over the bulk, then
+//! sha256d over its 16-byte result so the published id is 32 bytes like every other
+//! commitment in this format.
+//!
+//! NOT CRYPTOGRAPHIC OVER THE BULK, and that is a measured decision rather than a
+//! shortcut. sha256d over the 1.076 GB state was measured at MEM 1702%, INT 587%,
+//! VAR 387%, ICONST 254% and BRANCH 127% of their caps -- 2795 integer ops per 64-byte
+//! block, 16.8M blocks. It cannot run on chain.
+//!
+//! WHY A CHECKSUM IS ENOUGH HERE. The state is a deterministic function of published
+//! code, and the miner supplies nothing that feeds it, so there is no adversarial input
+//! and nothing to find a second preimage for. The property actually needed is "any
+//! accidental bit difference changes the digest", which a multiply-xor chain gives with
+//! overwhelming probability. If a later use of this ever digests state a miner CAN
+//! influence, this function is the wrong tool and the cost of the right one has to be
+//! paid elsewhere -- which is why it is named for what it is.
+//!
+//! Lane-parallel by construction: four independent accumulators, each covering every
+//! fourth 32-bit word. The scalar and SIMD paths therefore produce identical results for
+//! the same reason the LoRA apply does -- the arithmetic is uint32 and exact, so lane
+//! order cannot matter.
+//!
+//! LITTLE-ENDIAN BY DEFINITION. Both paths read the state as 32-bit words, so the digest
+//! depends on byte order within a word. That is not a consensus hazard, because the
+//! authority is the MODULE and wasm's memory model is little-endian by specification --
+//! every node computes the module's answer whatever its own CPU is. It does mean this
+//! function and the native generator that pins BTM_GENESIS_STATE_ID would disagree with
+//! the module if run on a big-endian host, so the pinned constant must be generated on a
+//! little-endian one. The check would catch the mistake rather than hide it, but it is
+//! cheaper to know than to debug.
+static inline void btmmoe_state_digest(const void* data, size_t nbytes, unsigned char out[32]) {
+    const unsigned char* p = (const unsigned char*)data;
+    const uint32_t K = 0x9E3779B9u;
+    uint32_t h[4] = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au};
+    size_t i = 0;
+#ifdef __wasm_simd128__
+    v128_t vh = wasm_v128_load(h);
+    const v128_t vk = wasm_u32x4_splat(K);
+    for (; i + 16 <= nbytes; i += 16) {
+        vh = wasm_i32x4_mul(wasm_v128_xor(vh, wasm_v128_load(p + i)), vk);
+    }
+    wasm_v128_store(h, vh);
+#else
+    for (; i + 16 <= nbytes; i += 16) {
+        uint32_t w[4];
+        memcpy(w, p + i, 16);
+        for (int l = 0; l < 4; l++) h[l] = (h[l] ^ w[l]) * K;
+    }
+#endif
+    /* tail: a state is a whole number of floats, so this is unreachable at the trunk's
+     * geometry, but a digest that silently ignored trailing bytes would be a trap. */
+    for (; i < nbytes; i++) h[i & 3] = (h[i & 3] ^ (uint32_t)p[i]) * K;
+
+    unsigned char digest[16];
+    for (int l = 0; l < 4; l++) {
+        uint32_t v = btmmoe_mix32(h[l]);     /* avalanche each lane before publishing */
+        digest[l * 4 + 0] = (unsigned char)v;
+        digest[l * 4 + 1] = (unsigned char)(v >> 8);
+        digest[l * 4 + 2] = (unsigned char)(v >> 16);
+        digest[l * 4 + 3] = (unsigned char)(v >> 24);
+    }
+    unsigned char first[32];
+    sha256_hash(digest, sizeof(digest), first);
+    sha256_hash(first, 32, out);
+}
+
+//! The digest of the base state this init produces, at the trunk's geometry
+//! (L=8, C=768, V=16384, E=16, H=192, K=3, seed BTM2_BASE_SEED).
+//!
+//! CONSENSUS. The verifier recomputes the init and refuses to commit a genesis state that
+//! does not hash to this. That check is not about trusting a miner -- the state is a pure
+//! function of this code, so there is nothing to forge -- it is about catching a BUILD
+//! that computes something else. Without it, a node whose compiler reordered a float
+//! operation would fold every record into its own private model and agree with itself
+//! forever, which is the one failure mode that produces no error anywhere.
+//!
+//! Regenerate it whenever anything upstream of the weights changes -- the mixer, the
+//! distribution, the scales, the fill order's index basis, the geometry, the seed -- OR
+//! when btmmoe_state_digest itself changes. It is a fingerprint of all of them at once.
+static const unsigned char BTM_GENESIS_STATE_ID[32] = {
+    0x0e, 0x33, 0x5b, 0x3a, 0x91, 0x0b, 0xd3, 0x04,
+    0x7b, 0xa3, 0xd9, 0x18, 0x83, 0xf8, 0x95, 0x2a,
+    0x8d, 0xe4, 0x77, 0x00, 0x49, 0x6d, 0xd2, 0xcc,
+    0x13, 0xc3, 0x36, 0xc0, 0x86, 0x2c, 0x38, 0xe3,
+};
+
+//! The base model. `params` must be zeroed by the caller: every bias stays zero, and only
+//! the tensors named here are written.
+//!
+//! Draw indices are GLOBAL parameter offsets, so a weight's value depends on where it
+//! lives in the array and nothing else -- not on which tensor is filled first, not on how
+//! many were filled before it. That is what makes the fill order irrelevant and the
+//! result reproducible from any starting point.
+static inline void btmmoe_init_base_params_cb(float* params, const size_t* param_sizes,
+                                              const size_t* tensor_offsets,
+                                              int L, int C, int V, int E, int H,
+                                              unsigned int seed) {
+    (void)E; (void)H; (void)C;
+    const float rs = 1.0f / sqrtf(2.0f * (float)L);
+    /* sqrt(3), so U(-a,a) has the variance N(0,scale) had. */
+    const float root3 = sqrtf(3.0f);
+    /* The seed enters as an additive offset to the index: one multiply, once, rather than
+     * per weight, and it still decorrelates two chains that differ only by seed. */
+    const uint32_t seed_off = (uint32_t)seed * 0x9E3779B9u;
+
+    for (size_t j = 0; j < param_sizes[2]; j++)  params[tensor_offsets[2] + j] = 1.0f;  // ln1w
+    for (size_t j = 0; j < param_sizes[8]; j++)  params[tensor_offsets[8] + j] = 1.0f;  // ln2w
+    for (size_t j = 0; j < param_sizes[14]; j++) params[tensor_offsets[14] + j] = 1.0f; // lnfw
+
+    const int order[7] = {0, 1, 4, 6, 10, 12, 16};
+    for (int oi = 0; oi < 7; oi++) {
+        int t = order[oi];
+        size_t n = param_sizes[t];
+        if (t == 0) n = (size_t)V * C;  // V rows of wte, not Vp: the pad stays zero
+        float scale = (t == 6 || t == 12) ? 0.02f * rs : 0.02f;
+        btmmoe_uniform_fill(params + tensor_offsets[t], n, tensor_offsets[t],
+                            seed_off, scale * root3);
+    }
+}
+
+// SUPERSEDED by btmmoe_init_base_params_cb above: kept because the miner's older chains
+// were built with it and because the gas comparison in that comment is only meaningful
+// next to the code it describes. Not reachable from the on-chain verifier.
 static inline void btmmoe_init_base_params(float* params, const size_t* param_sizes,
                                            const size_t* tensor_offsets,
                                            int L, int C, int V, int E, int H, unsigned int seed) {

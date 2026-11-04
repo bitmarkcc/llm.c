@@ -42,49 +42,8 @@ miner; the v2 logic starts at "v2 LoRA miner" near the end of the file.
 #include "llmc/btmcorpus_build.h"
 #include "llmc/btmcorpus_params.h"
 
-// trunk configuration (consensus parameters of this chain)
-//
-// E=32 => 269,428,992 total params = 1.004 GiB in f32. An expert is 2 * C*H * L =
-// 2 * 768*384 * 12 = 7,077,888 params, so halving E from 64 frees 226M params.
-//
-// NOT chosen to fit the verifier's 1.984 GiB linear-memory cap -- E=64 (1.849 GiB) fit
-// that. Chosen for the CHECKPOINT BUDGET.
-//
-// verify() must stream the weight checkpoint AND fold every delta published since it,
-// inside GAS_IO_BYTES_LIMIT (2 GiB) and GAS_IO_CALLS_LIMIT (4096). A smaller model leaves
-// room for more deltas per epoch, and at 16 min per slot block (NUM_ALGOS=8 x 2 min) that
-// is the length of the mining period between checkpoints:
-//
-//     E=64:  1.8485 GiB checkpoint -> 272 deltas fit ->  3.0 days of mining per epoch
-//     E=32:  1.0021 GiB checkpoint -> 1508 deltas fit -> 16.8 days of mining per epoch
-//
-// E=64 also made the checkpoint unpublishable in practice: 1.85 GiB takes ~2,036 slot
-// blocks (22.6 days) to transmit against a 3.0-day staleness bound, so it could never be
-// kept current, forcing dedicated publish phases and a ~12% useful-work duty cycle.
-//
-// A secondary gain: the model build streams half as much, ~19.6 s -> ~10 s measured.
-//
-// The freed linear memory (139 MiB -> 1006 MiB under the cap, against 52.7 MiB per
-// scoring window) would also permit scoring a record on ~19 windows instead of 1, which
-// would cut the gate's estimator noise as sqrt(W), sigma 0.067 -> ~0.015. That is NOT
-// done, and the blocker is gas, not memory: the forward is compute-bound (~4.4 FLOP per
-// weight byte), so W windows cost ~W times the instruction count, and the existing two
-// forwards already sit near GAS_LIMIT[GC_SIMD]. See the note at the scoring site in
-// eval_gpt2_btm_trunk_f32.c. E=32 keeps that option open for the day those limits are
-// revisited; it does not take it.
-//
-// The cost is half the trunk's expert capacity, which is a real loss for something whose
-// purpose is to BE a knowledge base. The settled 32:1 target (E~300, 2.2B, 8.8 GB) needs
-// memory64 or lazy expert loading -- see doc. All machinery below is E-agnostic.
-//
-// CONSENSUS-CRITICAL and must match the other file: E sizes the router entry (out = E)
-// and therefore the FRAMING of every record, and it sizes the base init and the expert
-// rotation, so a miner and a verifier that disagree cannot even walk the same chain.
-#ifndef MOE_E
-#define MOE_E 32
-#endif
-#define MOE_K 4   // active experts per token
-#define MOE_H 384 // expert hidden width (C/2): fine-grained experts
+// defines: the trunk geometry (E, K, H, L, C, V) -- CONSENSUS, single source of truth
+#include "llmc/btmtrunk_params.h"
 #include <float.h>
 #ifdef OMP
 #include <omp.h>
@@ -1427,13 +1386,19 @@ void gpt2_free(GPT2 *model) {
 // Build the model every attempt starts from: fixed-seed random MoE init
 // (consensus; distinct random experts, small random router) + chain records.
 void gpt2_build_base_trunk(GPT2 *model, int depth, uchar* cp, size_t cp_bytes) {
-    if (depth != 12) { fprintf(stderr, "trunk is depth 12 (C=768)\n"); exit(EXIT_FAILURE); }
-    model->config.num_layers = 12;
-    model->config.channels = 768;
-    model->config.num_heads = 12;
+    if (depth != TRUNK_LAYERS) {
+        fprintf(stderr, "error: asked for depth %d but the trunk is depth %d (C=%d). "
+                        "A caller is carrying its own layer count instead of TRUNK_LAYERS "
+                        "-- see llmc/btmtrunk_params.h.\n",
+                depth, TRUNK_LAYERS, TRUNK_CHANNELS);
+        exit(EXIT_FAILURE);
+    }
+    model->config.num_layers = TRUNK_LAYERS;
+    model->config.channels = TRUNK_CHANNELS;
+    model->config.num_heads = TRUNK_HEADS;
     model->config.max_seq_len = 1024;
-    model->config.vocab_size = 16384;
-    model->config.padded_vocab_size = 16384; // already %128==0, no padding needed
+    model->config.vocab_size = TRUNK_VOCAB;
+    model->config.padded_vocab_size = TRUNK_VOCAB; // no padding slack; see btmtrunk_params.h
 
     fill_in_parameter_sizes(model->param_sizes, model->config);
     model->num_parameters = 0;
@@ -1475,7 +1440,7 @@ void gpt2_build_base_trunk(GPT2 *model, int depth, uchar* cp, size_t cp_bytes) {
         } else {
             size_t off = 0;
             while (off < cp_bytes) {
-                size_t rsz = btmmoe_record_size_h(cp + off, cp_bytes - off, 768, MOE_H, MOE_E);
+                size_t rsz = btmmoe_record_size_h(cp + off, cp_bytes - off, TRUNK_CHANNELS, MOE_H, MOE_E);
                 if (rsz == 0) break;
                 if (memcmp(cp + off, cache_tip, 32) == 0) { need_init = 0; start_off = off + rsz; break; }
                 off += rsz;
@@ -1485,8 +1450,8 @@ void gpt2_build_base_trunk(GPT2 *model, int depth, uchar* cp, size_t cp_bytes) {
     if (need_init) {
         printf("state cache miss: full rebuild\n");
         memset(model->params_memory, 0, num_parameters_bytes);
-        btmmoe_init_base_params(model->params_memory, model->param_sizes, moe_offsets,
-                                12, 768, model->config.vocab_size, MOE_E, MOE_H, BTM2_BASE_SEED);
+        btmmoe_init_base_params_cb(model->params_memory, model->param_sizes, moe_offsets,
+                                TRUNK_LAYERS, TRUNK_CHANNELS, model->config.vocab_size, MOE_E, MOE_H, BTM2_BASE_SEED);
         start_off = 0;
     } else {
         printf("state cache hit (resuming at chain offset %zu)\n", start_off);
@@ -1500,17 +1465,17 @@ void gpt2_build_base_trunk(GPT2 *model, int depth, uchar* cp, size_t cp_bytes) {
     {
         size_t o2 = 0; // tip must reflect the FULL chain end, walk for the last head
         while (o2 < cp_bytes) {
-            size_t rsz = btmmoe_record_size_h(cp + o2, cp_bytes - o2, 768, MOE_H, MOE_E);
+            size_t rsz = btmmoe_record_size_h(cp + o2, cp_bytes - o2, TRUNK_CHANNELS, MOE_H, MOE_E);
             if (rsz == 0) break;
             last_head_off = o2;
             o2 += rsz;
         }
     }
     while (off < cp_bytes) {
-        size_t rsz = btmmoe_record_size_h(cp + off, cp_bytes - off, 768, MOE_H, MOE_E);
+        size_t rsz = btmmoe_record_size_h(cp + off, cp_bytes - off, TRUNK_CHANNELS, MOE_H, MOE_E);
         if (rsz == 0) { fprintf(stderr, "malformed trunk chain record at offset %zu\n", off); exit(EXIT_FAILURE); }
         if (btmmoe_apply_record_h(model->params_memory, cp + off, rsz,
-                                  12, 768, MOE_E, MOE_H, model->param_sizes, moe_offsets) != 0) {
+                                  TRUNK_LAYERS, TRUNK_CHANNELS, MOE_E, MOE_H, model->param_sizes, moe_offsets) != 0) {
             fprintf(stderr, "failed to apply trunk chain record at offset %zu\n", off); exit(EXIT_FAILURE);
         }
         applied_any = 1;
@@ -1768,8 +1733,18 @@ int gpt2_train_trunk(float* ploss, uchar** p_record, size_t* p_record_bytes,
     const size_t proof_bytes_max = (size_t)BTM2_PROOF_FIXED_BYTES + (size_t)proof_depth_max * 32;
     size_t rec_bytes = BTM2_HEADER_BYTES + delta_bytes + proof_bytes_max;
     uchar* rec = (uchar*)mallocCheck(rec_bytes);
+    // prev_head. An explicit block_hash wins (the dev path, for reproducing a specific
+    // record); otherwise the chain's FIRST record chains from BTM_GENESIS_STATE_ID.
+    //
+    // It used to be a 0xff sentinel, which is now wrong rather than merely arbitrary. On
+    // chain the first record's prev_head is whatever btmv_prev_head reads out of the
+    // newest slot block carrying a solution -- and that block is the genesis state
+    // commitment, whose solution IS the 32-byte state id. A record built over the old
+    // sentinel hashes to a different chaining preimage, so btmc_leaf_index picks a
+    // different scoring window and the verifier rejects it outright. Silent and total:
+    // the record looks well-formed and simply never validates.
     if (block_hash) memcpy(rec, block_hash, 32);
-    else memset(rec, 255, 32);
+    else memcpy(rec, BTM_GENESIS_STATE_ID, 32);
     uint16_t n_entries = (uint16_t)(n_mat + 1);  // + the corpus proof
     memcpy(rec + 32, &n_entries, 2);
     uchar* e = rec + BTM2_HEADER_BYTES;
@@ -2063,6 +2038,8 @@ static int btm_score_with_verifier(const uchar* cp, size_t cp_bytes,
     char line[4096];
     int got_loss = 0, got_base = 0;
     float loss = 0.0f, base = 0.0f;
+    char reject[4096];
+    reject[0] = '\0';
     while (fgets(line, sizeof(line), pp)) {
         // Take the LAST of each in case a future version prints more than one. Match
         // "base loss" before "val loss": the latter is not a substring of the former, but
@@ -2071,16 +2048,39 @@ static int btm_score_with_verifier(const uchar* cp, size_t cp_bytes,
         if (b && sscanf(b + 10, "%f", &base) == 1) { got_base = 1; continue; }
         const char* m = strstr(line, "val loss ");
         if (m && sscanf(m + 9, "%f", &loss) == 1) got_loss = 1;
-        if (strstr(line, "no valid solution")) {
-            printf("score: verifier rejects the candidate: %s", line);
-            pclose(pp);
-            return -5;
-        }
+        // Remembered, NOT returned on. Keep draining the pipe: returning here used to
+        // abandon it mid-stream, skip remove(tmp) and -- the actual damage -- discard the
+        // two losses already parsed above.
+        if (strstr(line, "no valid solution")) snprintf(reject, sizeof(reject), "%s", line);
     }
     pclose(pp);
     remove(tmp);
-    if (!got_loss) { printf("score: no val loss in the verifier's output\n"); return -6; }
-    if (!got_base) { printf("score: no base loss in the verifier's output\n"); return -7; }
+
+    // A FAILED GATE IS NOT AN UNSCORABLE RECORD, and conflating them hid the entire
+    // result of a calibration run: the verifier prints base loss, applies the delta,
+    // prints val loss, and only THEN gates -- so by the time it says "no valid solution:
+    // improvement ... is below the required ...", both numbers the caller wants are
+    // already in hand. Reporting that as "could not be scored" threw away the one
+    // measurement the run existed to produce, and made a gate miss indistinguishable
+    // from a malformed record.
+    //
+    // The discriminator is whether BOTH losses were parsed, not the wording of the
+    // message. That is deliberate: it keys on how far the verifier actually got rather
+    // than on text that could be reworded, and in the native harness the gate is the only
+    // rejection reachable after both losses are printed.
+    //
+    // So: both losses present -> return them and let the caller apply the gate and print
+    // PASS/FAIL, exactly as for a passing record. Anything else is structural (bad proof,
+    // head does not chain, delta will not apply) and stays an error.
+    if (!got_loss || !got_base) {
+        if (reject[0] != '\0') {
+            printf("score: verifier rejects the candidate: %s", reject);
+            return -5;
+        }
+        if (!got_loss) { printf("score: no val loss in the verifier's output\n"); return -6; }
+        printf("score: no base loss in the verifier's output\n");
+        return -7;
+    }
     // Recomputed here rather than parsed: the printed improvement is decimal text, and
     // the difference of the two parsed f32 losses is the exact value the verifier
     // computed. Nothing depends on the verifier's formatting.
@@ -2129,7 +2129,7 @@ int main(int argc, char** argv) {
         fcloseCheck(cpf);
         size_t off = 0;
         while (off < cp_bytes) {
-            size_t rsz = btmmoe_record_size_h(cp + off, cp_bytes - off, 768, MOE_H, MOE_E);
+            size_t rsz = btmmoe_record_size_h(cp + off, cp_bytes - off, TRUNK_CHANNELS, MOE_H, MOE_E);
             if (rsz == 0) { printf("malformed chain file\n"); exit(1); }
             if (off + rsz == cp_bytes) {
                 if (!block_hash) block_hash = (uchar*)mallocCheck(32);
@@ -2166,7 +2166,8 @@ int main(int argc, char** argv) {
         float loss = -1.0f;
         uchar* rec = 0;
         size_t rec_bytes = 0;
-        gpt2_train_trunk(&loss, &rec, &rec_bytes, block_hash, cp, cp_bytes, 12, seed_offset + (unsigned int)i);
+        gpt2_train_trunk(&loss, &rec, &rec_bytes, block_hash, cp, cp_bytes, TRUNK_LAYERS,
+                                 seed_offset + (unsigned int)i);
         // The numbers that decide anything are the VERIFIER's, so selection uses them.
         // The miner's own forward pass above is kept only as an advisory figure; the gap
         // between them is the -Ofast/-O2 float-semantics difference and is worth seeing.
@@ -2208,10 +2209,15 @@ int main(int argc, char** argv) {
         // would not be a solution -- a verifier rejects it and the miner retries, exactly
         // as with a nonce that misses its target. At 1/64 roughly 40% of honest
         // full-effort attempts land here, which is difficulty, not a defect.
+        // Wording is conditional on purpose: this fires BEFORE the BTM_NO_APPEND check
+        // below, and claiming "appending anyway" when the run is deliberately not
+        // appending is exactly the kind of log line that sends someone hunting a
+        // non-existent bug.
         printf("WARNING: the best attempt FAILS the gate (needed %+.8f, got %+.8f). "
-               "Appending anyway because this is an experiment chain; a real verifier "
-               "would score it as having no valid solution.\n",
-               btmmoe_gate_required(best_base, gate_nbits), best_improv);
+               "A real verifier would score it as having no valid solution.%s\n",
+               btmmoe_gate_required(best_base, gate_nbits), best_improv,
+               getenv("BTM_NO_APPEND") ? ""
+                   : " Appending anyway because this is an experiment chain.");
     }
 
     // Measurement runs need the numbers without the side effect. Appending the best of n
