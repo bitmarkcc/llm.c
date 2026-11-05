@@ -1491,6 +1491,131 @@ void gpt2_build_base_trunk(GPT2 *model, int depth, uchar* cp, size_t cp_bytes) {
 
 #define TRUNK_EXPERTS_PER_BLOCK 3 // experts per layer whose factors a block commits
 
+//! Load LoRA factors produced by an external trainer (dev/btm_train_torch.py).
+//!
+//! WHY THIS HOOK EXISTS. This file's training loop is plain C with OpenMP, and measured on
+//! a 2013 Xeon a record needs ~14 hours of it to clear the gate -- against a 16-minute
+//! slot. The same work is 1..7 minutes at 10 TFLOP/s, so the trainer has to be able to
+//! live on a GPU. Porting the MoE forward/backward to CUDA or HIP is not necessary to get
+//! there: a record carries int8 LoRA FACTORS, not a computation trace, so training
+//! determinism is irrelevant -- the quantization washes it out and the verifier applies
+//! fixed integers in f32. Any framework, any precision, any hardware.
+//!
+//! So the split is: the external trainer produces f32 factors, and everything that is
+//! CONSENSUS FORMAT stays here -- quantization, entry framing, the corpus proof, the
+//! chained head. There is exactly one implementation of each and this keeps it that way.
+//!
+//! The file carries the EXPERT SELECTION as well as the factors, because which experts a
+//! record commits is the miner's free choice (the record commits values, not the
+//! selection procedure), so the choice has to travel from whoever made it. The caller
+//! derives `sub` from it, rebuilds its own canonical entry list, and then calls
+//! btm_factors_check to assert the two agree on every dimension -- a disagreement between
+//! the trainer and this file must be a loud error, never a silently mis-shaped record.
+//!
+//!   magic "BTMF" | version u32 | L u32 | n_mat u32 | r u32
+//!   n_mat x { type u8, layer u8, expert i16, out u32, in u32 }
+//!   f32 A concatenated in entry order, then f32 B
+#define BTM_FACTOR_MAGIC 0x464d5442u  /* "BTMF" little-endian */
+#define BTM_FACTOR_VERSION 1u
+
+typedef struct {
+    uint32_t n_mat, r;
+    int* type; int* layer; int* expert; uint32_t* out; uint32_t* in_;
+    size_t nA, nB;
+    long a_off;            /* file offset where the A block begins */
+} btm_factors;
+
+static int btm_factors_open(const char* path, int L, btm_factors* fx) {
+    FILE* f = fopen(path, "rb");
+    if (!f) { printf("BTM_FACTORS: cannot open %s\n", path); return -1; }
+    uint32_t magic = 0, ver = 0, fl = 0, nm = 0, r = 0;
+    if (fread(&magic, 4, 1, f) != 1 || magic != BTM_FACTOR_MAGIC) {
+        printf("BTM_FACTORS: %s is not a factor file\n", path); fclose(f); return -1;
+    }
+    if (fread(&ver, 4, 1, f) != 1 || ver != BTM_FACTOR_VERSION) {
+        printf("BTM_FACTORS: version %u, expected %u\n", ver, BTM_FACTOR_VERSION);
+        fclose(f); return -1;
+    }
+    if (fread(&fl, 4, 1, f) != 1 || fread(&nm, 4, 1, f) != 1 || fread(&r, 4, 1, f) != 1) {
+        printf("BTM_FACTORS: truncated header\n"); fclose(f); return -1;
+    }
+    if ((int)fl != L) {
+        printf("BTM_FACTORS: trained for %u layers, this build is %d\n", fl, L);
+        fclose(f); return -1;
+    }
+    if (r != (uint32_t)BTM2_RANK) {
+        printf("BTM_FACTORS: rank %u, this format is %d\n", r, BTM2_RANK);
+        fclose(f); return -1;
+    }
+    fx->n_mat = nm; fx->r = r;
+    fx->type   = (int*)mallocCheck(nm * sizeof(int));
+    fx->layer  = (int*)mallocCheck(nm * sizeof(int));
+    fx->expert = (int*)mallocCheck(nm * sizeof(int));
+    fx->out    = (uint32_t*)mallocCheck(nm * sizeof(uint32_t));
+    fx->in_    = (uint32_t*)mallocCheck(nm * sizeof(uint32_t));
+    fx->nA = fx->nB = 0;
+    for (uint32_t i = 0; i < nm; i++) {
+        uint8_t t = 0, l = 0; int16_t e = 0; uint32_t o = 0, in = 0;
+        if (fread(&t,1,1,f)!=1 || fread(&l,1,1,f)!=1 || fread(&e,2,1,f)!=1
+            || fread(&o,4,1,f)!=1 || fread(&in,4,1,f)!=1) {
+            printf("BTM_FACTORS: truncated entry table at %u\n", i); fclose(f); return -1;
+        }
+        fx->type[i]=t; fx->layer[i]=l; fx->expert[i]=e; fx->out[i]=o; fx->in_[i]=in;
+        fx->nA += (size_t)o * r; fx->nB += (size_t)r * in;
+    }
+    fx->a_off = ftell(f);
+    fclose(f);
+    return 0;
+}
+
+//! Assert the caller's canonical entry list is the one the factors were trained for.
+static int btm_factors_check(const btm_factors* fx, int n_mat, const int* mtype,
+                             const int* mlayer, const int* mexpert,
+                             const int* mout, const int* min_) {
+    if ((int)fx->n_mat != n_mat) {
+        printf("BTM_FACTORS: %u entries, this geometry needs %d\n", fx->n_mat, n_mat);
+        return -1;
+    }
+    for (int i = 0; i < n_mat; i++) {
+        if (fx->type[i] != mtype[i] || fx->layer[i] != mlayer[i]
+            || fx->expert[i] != mexpert[i]
+            || (int)fx->out[i] != mout[i] || (int)fx->in_[i] != min_[i]) {
+            printf("BTM_FACTORS: entry %d disagrees -- file (t=%d l=%d e=%d %ux%u) vs "
+                   "this build (t=%d l=%d e=%d %dx%d)\n", i,
+                   fx->type[i], fx->layer[i], fx->expert[i], fx->out[i], fx->in_[i],
+                   mtype[i], mlayer[i], mexpert[i], mout[i], min_[i]);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int btm_factors_read(const char* path, const btm_factors* fx,
+                           float* fA, size_t nA, float* fB, size_t nB) {
+    if (fx->nA != nA || fx->nB != nB) {
+        printf("BTM_FACTORS: %zu A + %zu B floats, this build wants %zu + %zu\n",
+               fx->nA, fx->nB, nA, nB);
+        return -1;
+    }
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    int ok = fseek(f, fx->a_off, SEEK_SET) == 0
+             && fread(fA, sizeof(float), nA, f) == nA
+             && fread(fB, sizeof(float), nB, f) == nB;
+    if (ok) { /* nothing may follow the B block */
+        char extra; ok = fread(&extra, 1, 1, f) == 0;
+        if (!ok) printf("BTM_FACTORS: trailing bytes after the factor blocks\n");
+    } else {
+        printf("BTM_FACTORS: short read of the factor blocks\n");
+    }
+    fclose(f);
+    return ok ? 0 : -1;
+}
+
+static void btm_factors_free(btm_factors* fx) {
+    free(fx->type); free(fx->layer); free(fx->expert); free(fx->out); free(fx->in_);
+}
+
 // One trunk mining attempt. LoRA factors on: attention (qkvw, attprojw), the
 // router matrix, and a rotating subset of TRUNK_EXPERTS_PER_BLOCK experts per
 // layer chosen by the attempt seed (miner's free choice -- the record commits
@@ -1506,8 +1631,46 @@ int gpt2_train_trunk(float* ploss, uchar** p_record, size_t* p_record_bytes,
     size_t moe_offsets[BTMMOE_NUM_TENSORS];
     btmmoe_tensor_offsets(model.param_sizes, moe_offsets);
 
+    // An external trainer (dev/btm_train_torch.py) supplies both the factors and the
+    // expert selection they were trained for; see btm_factors_open. Opened here because
+    // `sub` has to come from the file before the entry list is built from it.
+    const char* factors_path = getenv("BTM_FACTORS");
+    btm_factors fx;
+    memset(&fx, 0, sizeof(fx));
+    int have_factors = 0;
+    if (factors_path) {
+        if (btm_factors_open(factors_path, L, &fx) != 0) exit(EXIT_FAILURE);
+        have_factors = 1;
+        printf("BTM_FACTORS=%s: %u entries, rank %u, %zu A + %zu B floats\n",
+               factors_path, fx.n_mat, fx.r, fx.nA, fx.nB);
+    }
+
     // rotating expert coverage: pick distinct experts per layer from the attempt seed
     int sub[12][TRUNK_EXPERTS_PER_BLOCK];
+    if (have_factors) {
+        // Read the selection out of the file: the type-10 entries name the committed
+        // experts, in the canonical per-layer order. Validated against the rebuilt entry
+        // list below, so a malformed table cannot slip past as a plausible selection.
+        int seen[12];
+        for (int l = 0; l < L; l++) seen[l] = 0;
+        for (uint32_t i = 0; i < fx.n_mat; i++) {
+            if (fx.type[i] != 10) continue;
+            int l = fx.layer[i];
+            if (l < 0 || l >= L || seen[l] >= TRUNK_EXPERTS_PER_BLOCK
+                || fx.expert[i] < 0 || fx.expert[i] >= MOE_E) {
+                printf("BTM_FACTORS: entry %u has an out-of-range layer/expert\n", i);
+                exit(EXIT_FAILURE);
+            }
+            sub[l][seen[l]++] = fx.expert[i];
+        }
+        for (int l = 0; l < L; l++) {
+            if (seen[l] != TRUNK_EXPERTS_PER_BLOCK) {
+                printf("BTM_FACTORS: layer %d names %d experts, expected %d\n",
+                       l, seen[l], TRUNK_EXPERTS_PER_BLOCK);
+                exit(EXIT_FAILURE);
+            }
+        }
+    } else {
     mt19937_state srng;
     manual_seed(&srng, attempt_seed ^ 0x9E3779B9u);
     for (int l = 0; l < L; l++) {
@@ -1521,6 +1684,7 @@ int gpt2_train_trunk(float* ploss, uchar** p_record, size_t* p_record_bytes,
                 if (!again) sub[l][i] = cand;
             }
         }
+    }
     }
 
     // canonical entry order per layer: qkvw(4), attprojw(6), routerw(16),
@@ -1567,10 +1731,22 @@ int gpt2_train_trunk(float* ploss, uchar** p_record, size_t* p_record_bytes,
 
     float* fA = (float*)mallocCheck(nA * sizeof(float));
     float* fB = (float*)mallocCheck(nB * sizeof(float));
+    if (have_factors) {
+        // The check that makes this hook safe: the entry list rebuilt above from the
+        // file's own selection must agree with the file's table on every type, layer,
+        // expert and dimension. Anything else is a trainer that disagrees with this
+        // build about the geometry, and a mis-shaped record is worse than no record.
+        if (btm_factors_check(&fx, n_mat, mtype, mlayer, mexpert, mout, min_) != 0)
+            exit(EXIT_FAILURE);
+        if (btm_factors_read(factors_path, &fx, fA, nA, fB, nB) != 0) exit(EXIT_FAILURE);
+        btm_factors_free(&fx);
+        printf("BTM_FACTORS: loaded; skipping the built-in training loop\n");
+    } else {
     mt19937_state arng;
     manual_seed(&arng, attempt_seed);
     normal_(fA, (unsigned int)nA, 0.0f, 0.02f, &arng);
     memset(fB, 0, nB * sizeof(float));
+    }
     float* dA = (float*)mallocCheck(nA * sizeof(float));
     float* dB = (float*)mallocCheck(nB * sizeof(float));
     size_t nF = nA + nB;
@@ -1605,8 +1781,12 @@ int gpt2_train_trunk(float* ploss, uchar** p_record, size_t* p_record_bytes,
     { const char* s = getenv("BTM_TRAIN_T");     if (s && atoi(s) > 0) T = atoi(s); }
     { const char* s = getenv("BTM_TRAIN_STEPS"); if (s && atoi(s) > 0) n_steps = atoi(s); }
     if (T > 1024) { printf("error: T=%d exceeds the model's max_seq_len of 1024\n", T); exit(1); }
-    printf("train shape: B=%d T=%d steps=%d -> %lld tokens per record\n",
-           B, T, n_steps, (long long)n_steps * B * T);
+    if (have_factors) {
+        printf("train shape: not used (factors supplied externally)\n");
+    } else {
+        printf("train shape: B=%d T=%d steps=%d -> %lld tokens per record\n",
+               B, T, n_steps, (long long)n_steps * B * T);
+    }
 
     // Only the TRAIN loader. The scored window comes from the corpus proof, not a
     // dataloader batch, so the old val_loader was dead weight -- and dataloader_init
@@ -1649,8 +1829,9 @@ int gpt2_train_trunk(float* ploss, uchar** p_record, size_t* p_record_bytes,
     // tokens barely enter. If that holds, lr buys in 3 minutes what n_steps buys in 45.
     float lr = 1e-3f, beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f;
     { const char* s = getenv("BTM_TRAIN_LR"); if (s && atof(s) > 0.0) lr = (float)atof(s); }
-    printf("train lr=%g (n_steps*lr = %g)\n", (double)lr, (double)n_steps * lr);
-    for (int step = 0; step < n_steps; step++) {
+    if (!have_factors) printf("train lr=%g (n_steps*lr = %g)\n",
+                               (double)lr, (double)n_steps * lr);
+    for (int step = 0; step < (have_factors ? 0 : n_steps); step++) {
         for (int i = 0; i < n_mat; i++) {
             int out = mout[i], in = min_[i];
             float* W = model.params_memory + woff[i];
